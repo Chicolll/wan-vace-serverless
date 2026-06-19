@@ -23,7 +23,12 @@ RUN git clone --depth 1 https://github.com/ali-vilab/VACE /opt/xdit/VACE \
  && git clone --depth 1 https://github.com/Wan-Video/Wan2.1 /opt/xdit/Wan2.1 \
  && pip install -r /opt/xdit/Wan2.1/requirements.txt \
  && if [ -f /opt/xdit/VACE/requirements/framework.txt ]; then pip install -r /opt/xdit/VACE/requirements/framework.txt; fi \
- && pip install "numpy<2"   # Wan requires numpy<2; pin LAST so it wins the opencv-headless>=2 conflict
+ && pip install "numpy<2" \
+ && pip uninstall -y onnxruntime onnxruntime-gpu \
+ && pip install "onnxruntime<1.20"   # FORCE the CPU onnxruntime LAST: VACE's annotator stack imports it at load,
+                                      # and the GPU variant pulled in needs libcudart.so.13 (CUDA 13) which the
+                                      # CUDA-12.4 image lacks -> ImportError. We don't use onnxruntime (unused pose
+                                      # annotator); the CPU build has no CUDA dep. <1.20 keeps numpy<2 compatibility.
 
 COPY handler.py /opt/xdit/handler.py
 

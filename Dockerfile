@@ -30,16 +30,10 @@ RUN git clone --depth 1 https://github.com/ali-vilab/VACE /opt/xdit/VACE \
                                       # CUDA-12.4 image lacks -> ImportError. We don't use onnxruntime (unused pose
                                       # annotator); the CPU build has no CUDA dep. <1.20 keeps numpy<2 compatibility.
 
-# BAKE the 75GB model into the image. The worker's writable container disk is too small for a 75GB RUNTIME
-# download (snapshot_download died "Background writer channel closed" = out of write space), and RunPod's
-# auto "Cached model" pre-stage is opaque/path-mismatched. Image layers have room and reads need no write disk,
-# so this is the one path with no runtime download, no cache lookup, no disk write. hf_transfer (fast,
-# multi-conn) + xet disabled (the xet writer is what failed on the worker; avoid it on the build too).
-RUN pip install -U "huggingface_hub[cli]" hf_transfer \
- && HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1 \
-    hf download Wan-AI/Wan2.1-VACE-14B --local-dir /opt/xdit/model \
- && test -f /opt/xdit/model/config.json   # fail the build if the model didn't land
-    # NOTE: huggingface-cli is deprecated/removed -> use `hf download` (the old name exits 1 immediately).
+# NOTE: baking the 75GB model into the image was tried and FAILS — the ~85GB image exceeds RunPod's build
+# export limit (download succeeds, then the final layer push dies). Model now comes from RunPod's "Cached model"
+# pre-stage (set on the endpoint); the handler resolves its on-disk location at runtime (see handler.py).
+RUN pip install -U "huggingface_hub[cli]" hf_transfer
 
 COPY handler.py /opt/xdit/handler.py
 

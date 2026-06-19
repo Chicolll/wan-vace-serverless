@@ -27,9 +27,51 @@ VENV_PY  = "/opt/xdit/venv/bin/python"
 TORCHRUN = "/opt/xdit/venv/bin/torchrun"
 VACE_DIR = "/opt/xdit/VACE"
 WAN_DIR  = "/opt/xdit/Wan2.1"
-VOL      = "/runpod-volume/native-xdit"           # network volume mount: INPUTS only now (model is baked in image)
-MODEL    = "/opt/xdit/model"                       # 75GB model BAKED into the image at build time (see Dockerfile):
-                                                  # no runtime download, no cache lookup, no write-disk needed.
+VOL      = "/runpod-volume/native-xdit"           # network volume mount: INPUTS staged here
+HF_REPO  = "Wan-AI/Wan2.1-VACE-14B"
+
+
+def _find_model():
+    """Locate the model dir that RunPod's 'Cached model' pre-stage put on disk (no download).
+    Returns the first dir containing config.json, else None. Covers HF-cache snapshot layout + flat dirs."""
+    import glob
+    cands = []
+    # explicit guesses
+    cands += ["/opt/xdit/model", f"{VOL}/model/Wan2.1-VACE-14B"]
+    # HF cache snapshot layout under common HF_HOME / cache roots (RunPod cached-model lands here)
+    roots = [os.environ.get("HF_HOME"), os.environ.get("HF_HUB_CACHE"), os.environ.get("HUGGINGFACE_HUB_CACHE"),
+             "/runpod-volume/huggingface-cache", "/runpod-volume/.cache/huggingface", "/root/.cache/huggingface",
+             os.path.expanduser("~/.cache/huggingface"), "/runpod/cache", "/cache/huggingface"]
+    for r in roots:
+        if not r:
+            continue
+        cands += glob.glob(f"{r}/**/models--Wan-AI--Wan2.1-VACE-14B/snapshots/*", recursive=True)
+        cands += glob.glob(f"{r}/**/Wan2.1-VACE-14B", recursive=True)
+    for c in cands:
+        if c and os.path.exists(os.path.join(c, "config.json")):
+            return c
+    return None
+
+
+def _debug_fs():
+    """Report env + filesystem so we can find where RunPod pre-staged the model."""
+    import glob
+    env = {k: v for k, v in os.environ.items()
+           if any(t in k.upper() for t in ("HF", "HUGGING", "CACHE", "MODEL", "RUNPOD", "VOLUME"))}
+    found = []
+    for base in ["/runpod-volume", "/root/.cache", "/cache", "/runpod", "/opt/xdit", os.path.expanduser("~/.cache")]:
+        try:
+            found += glob.glob(f"{base}/**/config.json", recursive=True)[:20]
+            found += glob.glob(f"{base}/**/*Wan2.1-VACE-14B*", recursive=True)[:20]
+        except Exception as e:
+            found.append(f"ERR {base}: {e}")
+    listings = {}
+    for d in ["/runpod-volume", "/root/.cache/huggingface", "/runpod-volume/huggingface-cache"]:
+        try:
+            listings[d] = os.listdir(d)[:30]
+        except Exception as e:
+            listings[d] = f"ERR {e}"
+    return {"env": env, "config_json_hits": sorted(set(found))[:40], "listings": listings}
 
 
 def _gpu_count():
@@ -48,6 +90,8 @@ def _resolve(p):
 
 def handler(event):
     job = (event or {}).get("input", {}) or {}
+    if job.get("debug"):
+        return _debug_fs()
     prompt = job.get("prompt", "")
     if not prompt:
         return {"error": "prompt is required"}
@@ -60,8 +104,10 @@ def handler(event):
     for label, path in (("src_video", src_video), ("src_mask", src_mask), ("src_ref_images", src_ref)):
         if not path or not os.path.exists(path):
             return {"error": f"missing input {label}: {path}"}
-    if not os.path.exists(f"{MODEL}/config.json"):
-        return {"error": f"baked model missing at {MODEL} — check the image build"}
+    MODEL = _find_model()
+    if not MODEL:
+        return {"error": "model not found on disk — RunPod cached-model pre-stage path unknown",
+                "debug": _debug_fs()}
 
     n = int(job.get("n_gpus") or _gpu_count())
     out_file = f"/tmp/out_{int(time.time())}.mp4"

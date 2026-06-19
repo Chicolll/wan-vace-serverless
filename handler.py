@@ -32,24 +32,27 @@ HF_REPO  = "Wan-AI/Wan2.1-VACE-14B"
 
 
 def _find_model():
-    """Locate the model dir that RunPod's 'Cached model' pre-stage put on disk (no download).
-    Returns the first dir containing config.json, else None. Covers HF-cache snapshot layout + flat dirs."""
+    """Locate the model dir RunPod's 'Cached model' pre-stage put on disk (no download, no write).
+    Prefers the FAST host model-store (/runpod/model-store, host-local) over the slow MooseFS volume cache.
+    Confirmed layout (2026-06-19 debug invoke): /runpod/model-store/huggingface/<MODEL_NAME>/<MODEL_REVISION>/."""
     import glob
+    mn = (os.environ.get("MODEL_NAME") or "wan-ai/wan2.1-vace-14b").strip("/")
+    mr = os.environ.get("MODEL_REVISION") or ""
     cands = []
-    # explicit guesses
-    cands += ["/opt/xdit/model", f"{VOL}/model/Wan2.1-VACE-14B"]
-    # HF cache snapshot layout under common HF_HOME / cache roots (RunPod cached-model lands here)
-    roots = [os.environ.get("HF_HOME"), os.environ.get("HF_HUB_CACHE"), os.environ.get("HUGGINGFACE_HUB_CACHE"),
-             "/runpod-volume/huggingface-cache", "/runpod-volume/.cache/huggingface", "/root/.cache/huggingface",
-             os.path.expanduser("~/.cache/huggingface"), "/runpod/cache", "/cache/huggingface"]
-    for r in roots:
-        if not r:
-            continue
-        cands += glob.glob(f"{r}/**/models--Wan-AI--Wan2.1-VACE-14B/snapshots/*", recursive=True)
-        cands += glob.glob(f"{r}/**/Wan2.1-VACE-14B", recursive=True)
+    # 1) FAST host model-store (preferred) — flat revision dir, then snapshot layout
+    if mr:
+        cands += [f"/runpod/model-store/huggingface/{mn}/{mr}",
+                  f"/runpod/model-store/huggingface/{mn}/{mr}/snapshots/{mr}"]
+    cands += glob.glob(f"/runpod/model-store/huggingface/{mn}/**/config.json", recursive=True)
+    # 2) volume HF cache (slow MooseFS) — fallback
+    cands += glob.glob("/runpod-volume/huggingface-cache/hub/models--*ace-14b/snapshots/*", recursive=True)
+    cands += glob.glob("/runpod-volume/huggingface-cache/hub/models--*VACE-14B/snapshots/*", recursive=True)
+    # 3) explicit prior copies
+    cands += [f"{VOL}/model/Wan2.1-VACE-14B", "/opt/xdit/model"]
     for c in cands:
-        if c and os.path.exists(os.path.join(c, "config.json")):
-            return c
+        d = os.path.dirname(c) if c.endswith("config.json") else c
+        if d and os.path.exists(os.path.join(d, "config.json")):
+            return d
     return None
 
 

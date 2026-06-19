@@ -27,20 +27,9 @@ VENV_PY  = "/opt/xdit/venv/bin/python"
 TORCHRUN = "/opt/xdit/venv/bin/torchrun"
 VACE_DIR = "/opt/xdit/VACE"
 WAN_DIR  = "/opt/xdit/Wan2.1"
-VOL      = "/runpod-volume/native-xdit"           # network volume mount: INPUTS only now (model comes from cache)
-HF_REPO  = "Wan-AI/Wan2.1-VACE-14B"
-_MODEL_DIR = None
-
-
-def _resolve_model():
-    # Model from RunPod's host-side HuggingFace cache (endpoint "Cached model" = HF_REPO pre-stages it on the host,
-    # NOT billed), NOT the 75GB MooseFS volume load (~15min, billed). snapshot_download returns the local cached
-    # snapshot dir (config.json + safetensors + T5/VAE + tokenizer) that --ckpt_dir consumes; ~instant when warm.
-    global _MODEL_DIR
-    if _MODEL_DIR is None:
-        from huggingface_hub import snapshot_download
-        _MODEL_DIR = snapshot_download(HF_REPO)
-    return _MODEL_DIR
+VOL      = "/runpod-volume/native-xdit"           # network volume mount: INPUTS only now (model is baked in image)
+MODEL    = "/opt/xdit/model"                       # 75GB model BAKED into the image at build time (see Dockerfile):
+                                                  # no runtime download, no cache lookup, no write-disk needed.
 
 
 def _gpu_count():
@@ -71,11 +60,8 @@ def handler(event):
     for label, path in (("src_video", src_video), ("src_mask", src_mask), ("src_ref_images", src_ref)):
         if not path or not os.path.exists(path):
             return {"error": f"missing input {label}: {path}"}
-    t_load = time.time()
-    MODEL = _resolve_model()           # HF host-cache (instant when warm); falls through to download if cold
-    load_s = round(time.time() - t_load, 1)
     if not os.path.exists(f"{MODEL}/config.json"):
-        return {"error": f"model not resolved at {MODEL} — is the 'Cached model' set on the endpoint?"}
+        return {"error": f"baked model missing at {MODEL} — check the image build"}
 
     n = int(job.get("n_gpus") or _gpu_count())
     out_file = f"/tmp/out_{int(time.time())}.mp4"
@@ -113,7 +99,7 @@ def handler(event):
         os.remove(out_file)
     except OSError:
         pass
-    return {"video_base64": data, "bytes": sz, "seconds": dur, "model_load_seconds": load_s, "n_gpus": n,
+    return {"video_base64": data, "bytes": sz, "seconds": dur, "n_gpus": n,
             "size": size, "frame_num": frames, "sample_steps": steps}
 
 

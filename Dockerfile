@@ -11,7 +11,11 @@ WORKDIR /opt/xdit
 RUN python3.11 -m venv /opt/xdit/venv
 ENV PATH=/opt/xdit/venv/bin:$PATH
 
-RUN pip install -U pip wheel setuptools \
+# CACHEBUST: RunPod's build cache got a corrupted entry for this layer's old digest (157e9d1a) -> every
+# rebuild failed at "exporting cache ... unexpected commit digest ... failed precondition". Changing this
+# RUN's content forces a fresh layer digest that won't collide with the poisoned cache entry. Bump to retry.
+RUN echo "cachebust=2026-06-19-a" \
+ && pip install -U pip wheel setuptools \
  && pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 \
  && pip install ninja "xfuser>=0.4.1" \
  && pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" \

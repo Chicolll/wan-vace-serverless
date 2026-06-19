@@ -37,8 +37,9 @@ RUN git clone --depth 1 https://github.com/ali-vilab/VACE /opt/xdit/VACE \
 # multi-conn) + xet disabled (the xet writer is what failed on the worker; avoid it on the build too).
 RUN pip install -U "huggingface_hub[cli]" hf_transfer \
  && HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1 \
-    huggingface-cli download Wan-AI/Wan2.1-VACE-14B --local-dir /opt/xdit/model \
+    hf download Wan-AI/Wan2.1-VACE-14B --local-dir /opt/xdit/model \
  && test -f /opt/xdit/model/config.json   # fail the build if the model didn't land
+    # NOTE: huggingface-cli is deprecated/removed -> use `hf download` (the old name exits 1 immediately).
 
 COPY handler.py /opt/xdit/handler.py
 

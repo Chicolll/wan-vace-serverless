@@ -21,6 +21,12 @@ Request schema (event["input"]):
   n_gpus           (int, default = all visible GPUs on the worker)
 """
 import os, subprocess, base64, time
+# Keep the PARENT runpod-handler process OFF the GPU. On serverless it otherwise holds a ~730MB CUDA context
+# ("Process 48" in the OOM dump) that the bare-pod script didn't — and that 730MB is exactly what tips the
+# 76GB model + 2GB VAE-encode over the 80GB H100 (single-GPU OOMs at vae.encode by ~150MB). We capture the
+# GPU(s) RunPod assigned, blank them for the parent, and hand them back to the render subprocess only.
+_GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import runpod
 
 VENV_PY  = "/opt/xdit/venv/bin/python"
@@ -132,6 +138,7 @@ def handler(event):
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{WAN_DIR}:{VACE_DIR}:" + env.get("PYTHONPATH", "")
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    env["CUDA_VISIBLE_DEVICES"] = _GPUS   # hand the GPU(s) to the render subprocess (parent stays off-GPU)
 
     base = [
         "vace/vace_wan_inference.py", "--model_name", "vace-14B", "--size", size,

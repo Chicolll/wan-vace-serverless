@@ -25,8 +25,8 @@ import os, subprocess, base64, time
 # ("Process 48" in the OOM dump) that the bare-pod script didn't — and that 730MB is exactly what tips the
 # 76GB model + 2GB VAE-encode over the 80GB H100 (single-GPU OOMs at vae.encode by ~150MB). We capture the
 # GPU(s) RunPod assigned, blank them for the parent, and hand them back to the render subprocess only.
-_GPUS = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+_NVIS = os.environ.get("CUDA_VISIBLE_DEVICES")   # what RunPod assigned (may be None / "" / "0" / "0,1")
+os.environ["CUDA_VISIBLE_DEVICES"] = ""           # parent runpod process stays OFF the GPU (frees ~730MB)
 import runpod
 
 VENV_PY  = "/opt/xdit/venv/bin/python"
@@ -138,7 +138,10 @@ def handler(event):
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{WAN_DIR}:{VACE_DIR}:" + env.get("PYTHONPATH", "")
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    env["CUDA_VISIBLE_DEVICES"] = _GPUS   # hand the GPU(s) to the render subprocess (parent stays off-GPU)
+    # Hand the GPU(s) back to the render subprocess. If RunPod assigned a specific list, use it; otherwise
+    # (unset) expose all n physical GPUs as 0..n-1 — critical for multi-GPU: defaulting to "0" made rank 1
+    # hit "invalid device ordinal" (2026-06-20 burn).
+    env["CUDA_VISIBLE_DEVICES"] = _NVIS if _NVIS else ",".join(str(i) for i in range(n))
 
     base = [
         "vace/vace_wan_inference.py", "--model_name", "vace-14B", "--size", size,

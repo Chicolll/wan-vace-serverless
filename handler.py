@@ -31,50 +31,64 @@ VOL      = "/runpod-volume/native-xdit"           # network volume mount: INPUTS
 HF_REPO  = "Wan-AI/Wan2.1-VACE-14B"
 
 
+def _has_weights(d):
+    """A valid --ckpt_dir needs the diffusion weights, not just config.json. VaceWanModel.from_pretrained
+    (diffusers) wants diffusion_pytorch_model.safetensors (single OR sharded *-of-*.safetensors + index)."""
+    import glob
+    if not d or not os.path.exists(os.path.join(d, "config.json")):
+        return False
+    return bool(glob.glob(os.path.join(d, "diffusion_pytorch_model*.safetensors"))
+                or glob.glob(os.path.join(d, "diffusion_pytorch_model*.bin")))
+
+
 def _find_model():
-    """Locate the model dir RunPod's 'Cached model' pre-stage put on disk (no download, no write).
-    Prefers the FAST host model-store (/runpod/model-store, host-local) over the slow MooseFS volume cache.
-    Confirmed layout (2026-06-19 debug invoke): /runpod/model-store/huggingface/<MODEL_NAME>/<MODEL_REVISION>/."""
+    """Locate a COMPLETE model dir (config.json + diffusion weights) RunPod pre-staged — no download/write.
+    Prefers FAST host model-store (/runpod/model-store) over slow MooseFS volume. The flat host-store revision
+    dir has only config.json (2026-06-20 burn); the real weights live in its snapshots/<rev>/ subdir, so check
+    that first, and REQUIRE weights present so an incomplete dir is skipped."""
     import glob
     mn = (os.environ.get("MODEL_NAME") or "wan-ai/wan2.1-vace-14b").strip("/")
     mr = os.environ.get("MODEL_REVISION") or ""
     cands = []
-    # 1) FAST host model-store (preferred) — flat revision dir, then snapshot layout
+    base = f"/runpod/model-store/huggingface/{mn}"
     if mr:
-        cands += [f"/runpod/model-store/huggingface/{mn}/{mr}",
-                  f"/runpod/model-store/huggingface/{mn}/{mr}/snapshots/{mr}"]
-    cands += glob.glob(f"/runpod/model-store/huggingface/{mn}/**/config.json", recursive=True)
-    # 2) volume HF cache (slow MooseFS) — fallback
+        cands += [f"{base}/{mr}/snapshots/{mr}", f"{base}/{mr}"]          # snapshot subdir first (has weights)
+    cands += glob.glob(f"{base}/**/snapshots/*", recursive=True)
+    cands += [os.path.dirname(c) for c in glob.glob(f"{base}/**/config.json", recursive=True)]
     cands += glob.glob("/runpod-volume/huggingface-cache/hub/models--*ace-14b/snapshots/*", recursive=True)
-    cands += glob.glob("/runpod-volume/huggingface-cache/hub/models--*VACE-14B/snapshots/*", recursive=True)
-    # 3) explicit prior copies
     cands += [f"{VOL}/model/Wan2.1-VACE-14B", "/opt/xdit/model"]
-    for c in cands:
-        d = os.path.dirname(c) if c.endswith("config.json") else c
-        if d and os.path.exists(os.path.join(d, "config.json")):
+    for d in cands:
+        if _has_weights(d):
             return d
     return None
 
 
 def _debug_fs():
-    """Report env + filesystem so we can find where RunPod pre-staged the model."""
+    """Report env + WHERE the weights actually are: list each candidate dir's files + sizes."""
     import glob
     env = {k: v for k, v in os.environ.items()
            if any(t in k.upper() for t in ("HF", "HUGGING", "CACHE", "MODEL", "RUNPOD", "VOLUME"))}
-    found = []
-    for base in ["/runpod-volume", "/root/.cache", "/cache", "/runpod", "/opt/xdit", os.path.expanduser("~/.cache")]:
-        try:
-            found += glob.glob(f"{base}/**/config.json", recursive=True)[:20]
-            found += glob.glob(f"{base}/**/*Wan2.1-VACE-14B*", recursive=True)[:20]
-        except Exception as e:
-            found.append(f"ERR {base}: {e}")
+    mn = (os.environ.get("MODEL_NAME") or "wan-ai/wan2.1-vace-14b").strip("/")
+    mr = os.environ.get("MODEL_REVISION") or ""
+    dirs = [f"/runpod/model-store/huggingface/{mn}/{mr}",
+            f"/runpod/model-store/huggingface/{mn}/{mr}/snapshots/{mr}",
+            f"{VOL}/model/Wan2.1-VACE-14B"]
+    dirs += glob.glob("/runpod-volume/huggingface-cache/hub/models--*ace-14b/snapshots/*", recursive=True)
     listings = {}
-    for d in ["/runpod-volume", "/root/.cache/huggingface", "/runpod-volume/huggingface-cache"]:
+    for d in dirs:
         try:
-            listings[d] = os.listdir(d)[:30]
+            entries = []
+            for f in sorted(os.listdir(d)):
+                p = os.path.join(d, f)
+                try:
+                    sz = os.path.getsize(p)  # follows symlinks
+                except OSError:
+                    sz = -1
+                entries.append(f"{f} ({sz})")
+            listings[d] = {"files": entries, "has_weights": _has_weights(d)}
         except Exception as e:
             listings[d] = f"ERR {e}"
-    return {"env": env, "config_json_hits": sorted(set(found))[:40], "listings": listings}
+    return {"env": env, "resolved_by_find_model": _find_model(), "listings": listings}
 
 
 def _gpu_count():

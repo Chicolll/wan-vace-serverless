@@ -276,16 +276,18 @@ def handler(event):
         return {"error": "handler exception", "trace": traceback.format_exc(), "worker_id": WORKER_ID}
 
 
-# The volume's ComfyUI model files are symlinks to /workspace/hf-cache/... (the POD mount point). On serverless the
-# volume mounts at /runpod-volume, so those symlinks dangle. Make /workspace resolve to the volume → every model
-# symlink (gguf / lora / clip / vae, all under hf-cache/) resolves to the real blob in one shot. MUST run before ComfyUI.
+# The volume's ComfyUI model files are symlinks whose targets are /workspace/hf-cache/... (the POD mount point). On
+# serverless the volume mounts at /runpod-volume AND /workspace already exists as a bare dir, so those symlinks dangle.
+# Create /workspace/hf-cache -> /runpod-volume/hf-cache so every model symlink (gguf/lora/clip/vae, all under hf-cache/)
+# resolves to the real blob. MUST run before ComfyUI loads anything.
 try:
-    if not os.path.lexists("/workspace"):
-        os.symlink(VOL, "/workspace"); log("linked /workspace ->", VOL)
-    else:
-        log("/workspace already exists ->", os.path.realpath("/workspace"))
+    os.makedirs("/workspace", exist_ok=True)
+    _hf = "/workspace/hf-cache"
+    if not os.path.lexists(_hf):
+        os.symlink(os.path.join(VOL, "hf-cache"), _hf)
+    log("workspace/hf-cache ->", os.path.realpath(_hf), "resolves:", os.path.exists(_hf))
 except Exception as e:
-    log("workspace symlink failed:", repr(e))
+    log("hf-cache link failed:", repr(e))
 
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "

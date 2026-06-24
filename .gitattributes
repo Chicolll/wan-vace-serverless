@@ -1,0 +1,5 @@
+# Linux build context — force LF so a Windows CRLF never breaks the image build (e.g. /bin/bash^M on the .sh).
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.json text eol=lf

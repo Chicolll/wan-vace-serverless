@@ -1,0 +1,196 @@
+{
+  "1": {
+    "class_type": "RayInitializer",
+    "inputs": {
+      "ray_cluster_address": "local",
+      "ray_cluster_namespace": "default",
+      "GPU": 1,
+      "ulysses_degree": 1,
+      "ring_degree": 1,
+      "cfg_degree": 1,
+      "dp_degree": 1,
+      "sync_ulysses": false,
+      "clear_vram_after_sampling": true,
+      "FSDP": false,
+      "FSDP_CPU_OFFLOAD": false,
+      "XFuser_attention": "TORCH_FLASH",
+      "skip_comm_test": false,
+      "use_mmap": false
+    },
+    "_meta": { "title": "RayInitializer" }
+  },
+  "2": {
+    "class_type": "RayLoraLoader",
+    "inputs": {
+      "lora_name": "Wan2.1_T2V_14B_FusionX_LoRA.safetensors",
+      "strength_model": 1.0
+    },
+    "_meta": { "title": "Ray LoRA (FusionX)" }
+  },
+  "3": {
+    "class_type": "RayGGUFLoader",
+    "inputs": {
+      "unet_name": "gguf/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf",
+      "dequant_dtype": "default",
+      "patch_dtype": "default",
+      "ray_actors_init": ["1", 0],
+      "lora": ["2", 0]
+    },
+    "_meta": { "title": "Ray GGUF Loader (VACE Q4)" }
+  },
+  "4": {
+    "class_type": "RayModelSamplingSD3",
+    "inputs": {
+      "ray_actors": ["3", 0],
+      "shift": 6.0
+    },
+    "_meta": { "title": "Ray ModelSamplingSD3" }
+  },
+  "5": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "_meta": { "title": "Load CLIP (umt5)" }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "wan_2.1_vae.safetensors" },
+    "_meta": { "title": "Load VAE" }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "A realistic handheld video walking along a sunny beach shoreline. Wet sand underfoot, gentle ocean waves, turquoise water, distant horizon, soft coastal sunlight, natural shadows, palm trees and beach vegetation in the distance. Preserve the foreground subject identity, body, outfit, pose and framing. Photorealistic natural camera footage, stable beach background, realistic lighting, realistic depth of field.",
+      "clip": ["5", 0]
+    },
+    "_meta": { "title": "Positive" }
+  },
+  "8": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "cartoon, illustration, watercolor, sketch, painting, anime, overexposed, low quality, blurry details, jpeg artifacts, deformed body, distorted face, extra limbs, missing limbs, static frame, inconsistent background, flickering background, duplicated subject, text, subtitles, logo, watermark",
+      "clip": ["5", 0]
+    },
+    "_meta": { "title": "Negative" }
+  },
+  "9": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "mixkit_forest_walk_pre83_1280x720_driving.mp4",
+      "force_rate": 24,
+      "custom_width": 1280,
+      "custom_height": 720,
+      "frame_load_cap": 81,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "None"
+    },
+    "_meta": { "title": "DRIVING VIDEO" }
+  },
+  "10": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "mixkit_forest_walk_pre83_1280x720_mask_inverted.mp4",
+      "force_rate": 24,
+      "custom_width": 1280,
+      "custom_height": 720,
+      "frame_load_cap": 81,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "None"
+    },
+    "_meta": { "title": "MASK (inverted)" }
+  },
+  "11": {
+    "class_type": "ImageToMask",
+    "inputs": { "image": ["10", 0], "channel": "red" },
+    "_meta": { "title": "Image to Mask" }
+  },
+  "12": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "mixkit_forest_walk_beach_startimage.png" },
+    "_meta": { "title": "Reference / Start Image" }
+  },
+  "13": {
+    "class_type": "ImageResizeKJv2",
+    "inputs": {
+      "image": ["12", 0],
+      "width": 1280,
+      "height": 720,
+      "upscale_method": "lanczos",
+      "keep_proportion": "pad_edge_pixel",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 2,
+      "device": "cpu"
+    },
+    "_meta": { "title": "Resize Reference" }
+  },
+  "14": {
+    "class_type": "WanVaceToVideo",
+    "inputs": {
+      "positive": ["7", 0],
+      "negative": ["8", 0],
+      "vae": ["6", 0],
+      "width": 1280,
+      "height": 720,
+      "length": 81,
+      "batch_size": 1,
+      "strength": 1.0,
+      "control_video": ["9", 0],
+      "control_masks": ["11", 0],
+      "reference_image": ["13", 0]
+    },
+    "_meta": { "title": "WanVaceToVideo (control encode)" }
+  },
+  "15": {
+    "class_type": "XFuserKSamplerAdvanced",
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": 1234567,
+      "steps": 6,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "ray_actors": ["4", 0],
+      "positive": ["14", 0],
+      "negative": ["14", 1],
+      "latent_image": ["14", 2],
+      "start_at_step": 0,
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "denoise": 1.0
+    },
+    "_meta": { "title": "XFuser KSampler (USP)" }
+  },
+  "16": {
+    "class_type": "TrimVideoLatent",
+    "inputs": { "samples": ["15", 0], "trim_amount": ["14", 3] },
+    "_meta": { "title": "Trim Video Latent" }
+  },
+  "17": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["16", 0], "vae": ["6", 0] },
+    "_meta": { "title": "VAE Decode" }
+  },
+  "18": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": ["17", 0],
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "RAYLIGHT_VACE_TEST/ray",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true,
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": false,
+      "trim_to_audio": false
+    },
+    "_meta": { "title": "Video Combine" }
+  }
+}

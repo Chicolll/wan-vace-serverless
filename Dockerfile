@@ -1,47 +1,43 @@
-# Serverless worker image for native Wan2.1-VACE-14B xfuser render.
-# Bakes venv + repos + deps ONLY (~12-15GB). The 75GB model is NOT baked — it mounts from the network volume
-# at /runpod-volume (RunPod recommends against baking large models; image stays lean for fast cold start).
-# Reconstructs the EXACT environment validated 2026-06-18 (torch 2.6 + xfuser + flash-attn matched ABI + Wan/VACE
-# deps incl ftfy/pycocotools/framework). Build for linux/amd64 (RunPod arch).
+# Serverless worker image — Raylight (ComfyUI + Wan2.1-VACE-14B Q4 GGUF + FusionX) USP render.
+#
+# Mirrors the native lean-image pattern: bakes env + ComfyUI + the custom nodes the workflow uses (~18GB). The ~18GB
+# MODEL set is NOT baked (same 85GB export wall that killed the native bake) — it comes from the mounted network
+# volume at runtime via /opt/extra_model_paths.yaml. Reconstructs the PROVEN pod recipe (raylight_full_install.sh:
+# torch 2.6 + ray + xfuser + node reqs + pins transformers 4.49 / diffusers 0.33 / nccl 2.28.9 / numpy<2) into
+# SYSTEM python3.11. Build for linux/amd64 (RunPod arch).
+#
+# CONFIRM BEFORE A PRODUCTION BUILD (flagged, not guessed):
+#  - custom-node REVISIONS: Raylight is pinned to ec3ac78 (the proven rev); the others clone latest. Pin them to the
+#    volume's working custom_nodes revs for exact reproducibility. The set below is scoped to nodes raylight_vace_wf.json
+#    actually references (WanVaceToVideo is CORE ComfyUI). If a "missing node" error appears, add WanVideoWrapper /
+#    WanVaceAdvanced / Easy-Use (the broader recipe set).
+#  - MODEL PATHS: extra_model_paths.yaml points at the volume's ComfyUI model tree — verify the subpaths (esp. where
+#    the GGUF lives) against the actual volume layout.
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
-WORKDIR /opt/xdit
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 COMFY_DIR=/opt/ComfyUI
+WORKDIR /opt
 
-# OWN venv with torch 2.6 (image ships 2.4, too old for xfuser's diffusers>=0.33 flash-attn-3 custom-op schema).
-RUN python3.11 -m venv /opt/xdit/venv
-ENV PATH=/opt/xdit/venv/bin:$PATH
+# ComfyUI + only the custom nodes raylight_vace_wf.json references (Raylight pinned; canonical repos).
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
+ && cd /opt/ComfyUI/custom_nodes \
+ && git clone https://github.com/komikndr/raylight && (cd raylight && git checkout ec3ac78) \
+ && git clone --depth 1 https://github.com/city96/ComfyUI-GGUF \
+ && git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes \
+ && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 
-# CACHEBUST: RunPod's build cache got a corrupted entry for this layer's old digest (157e9d1a) -> every
-# rebuild failed at "exporting cache ... unexpected commit digest ... failed precondition". Changing this
-# RUN's content forces a fresh layer digest that won't collide with the poisoned cache entry. Bump to retry.
-RUN echo "cachebust=2026-06-19-a" \
- && pip install -U pip wheel setuptools \
- && pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 \
- && pip install ninja "xfuser>=0.4.1" \
- && pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" \
- && pip install ftfy pycocotools easydict opencv-python-headless imageio imageio-ffmpeg scikit-image matplotlib scipy onnxruntime runpod
+# Proven Raylight env recipe into SYSTEM python3.11, against /opt/ComfyUI (COMFY_DIR override).
+COPY raylight_full_install.sh /opt/raylight_full_install.sh
+RUN COMFY_DIR=/opt/ComfyUI bash /opt/raylight_full_install.sh; tail -n 60 /root/install.log || true
 
-# Repos + their requirements. ftfy/pycocotools above are REQUIRED — vace_wan_inference.py imports the whole
-# annotator stack at module load even for masked inpainting (2026-06-18 burn).
-RUN git clone --depth 1 https://github.com/ali-vilab/VACE /opt/xdit/VACE \
- && git clone --depth 1 https://github.com/Wan-Video/Wan2.1 /opt/xdit/Wan2.1 \
- && pip install -r /opt/xdit/Wan2.1/requirements.txt \
- && if [ -f /opt/xdit/VACE/requirements/framework.txt ]; then pip install -r /opt/xdit/VACE/requirements/framework.txt; fi \
- && pip install "numpy<2" \
- && pip uninstall -y onnxruntime onnxruntime-gpu \
- && pip install "onnxruntime<1.20"   # FORCE the CPU onnxruntime LAST: VACE's annotator stack imports it at load,
-                                      # and the GPU variant pulled in needs libcudart.so.13 (CUDA 13) which the
-                                      # CUDA-12.4 image lacks -> ImportError. We don't use onnxruntime (unused pose
-                                      # annotator); the CPU build has no CUDA dep. <1.20 keeps numpy<2 compatibility.
+# Hard build-time import gate — a broken dep fails the BUILD, never a live (metered) worker.
+RUN python3.11 -c "import torch, xfuser, ray, diffusers, transformers, yunchang; \
+print('IMG_ENV_OK', torch.__version__, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
 
-# NOTE: baking the 75GB model into the image was tried and FAILS — the ~85GB image exceeds RunPod's build
-# export limit (download succeeds, then the final layer push dies). Model now comes from RunPod's "Cached model"
-# pre-stage (set on the endpoint); the handler resolves its on-disk location at runtime (see handler.py).
-RUN pip install -U "huggingface_hub[cli]" hf_transfer
+# Handler + launcher + workflow + model-path map (models themselves mount from the volume at runtime).
+COPY handler_raylight.py   /opt/handler_raylight.py
+COPY comfy_launch.py       /opt/comfy_launch.py
+COPY raylight_vace_wf.json /opt/raylight_vace_wf.json
+COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 
-COPY handler.py /opt/xdit/handler.py
-
-# import sanity at BUILD time — a broken dep fails the build, never a live worker.
-RUN python -c "import torch, xfuser, flash_attn, ftfy, pycocotools, runpod; print('IMG_ENV_OK', torch.__version__)"
-
-CMD ["python", "-u", "/opt/xdit/handler.py"]
+ENV WF_PATH=/opt/raylight_vace_wf.json EXTRA_MODEL_PATHS=/opt/extra_model_paths.yaml
+CMD ["python3.11", "-u", "/opt/handler_raylight.py"]

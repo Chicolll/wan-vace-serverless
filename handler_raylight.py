@@ -1,35 +1,25 @@
 #!/usr/bin/env python3
 """RunPod Serverless handler — Raylight (ComfyUI + Wan2.1-VACE-14B Q4 GGUF + FusionX) USP render.
 
-NET-NEW path (2026-06-24). The native bf16 75GB serverless path worked but was closed on cost/fit; this wraps the
-Raylight GGUF stack (proven on pods: VACE survives USP at 1/2/4/8) as a serverless worker, to characterize the
-cold-load / warm-worker economics a pod cannot show. **Starting at 1 GPU** (cheapest, simplest, answers the crux
-without USP); n_gpus>1 supported for later.
-
-ARCHITECTURE (persistent_server — the warm path must be architecturally possible, then VERIFIED at runtime):
-  - The runpod PARENT process stays OFF the GPU (native fix: a ~730MB parent CUDA ctx tipped OOM). ComfyUI runs as a
-    SUBPROCESS that owns the GPU(s); Ray actors are its children.
-  - ComfyUI+Raylight is launched ONCE at module-load and kept alive => a WARM worker keeps the dequantized model
-    resident. handler(job) only submits the workflow to local ComfyUI :8188 and polls /history.
-  - Env+ComfyUI+nodes baked in the image (COMFY_DIR); the ~18GB model set + inputs on the mounted volume.
-
-CRUX LEVER: RayInitializer.clear_vram_after_sampling forced FALSE so the model stays resident across requests.
-Whether that TRULY holds (vs silent ~300s re-dequant, or RunPod killing the worker at idleTimeout=5s first) is what
-the telemetry measures: cold/ordinal/epoch + VRAM-residency-at-entry + total time → the consensus class label.
-
-TELEMETRY (per cloud_benchmark/serverless_monitoring_spec.md): worker self-narrates to the VOLUME via append+fsync
-beacons (boot / req_entry / req_exit / heartbeat / death) because the worker EVAPORATES at idleTimeout taking its
-container FS with it. Assume SIGKILL → per-request flush is the safety net, the death beacon is a bonus. The FULL
-in-worker RENDER telemetry (§1-§2c: DCGM/NVLink/NCCL/py-spy/nsys/quality) plugs into _render_telemetry_start/stop.
-Precise RayGGUFLoader dequant-duration needs wrapping the Raylight loader node (deeper hook, flagged in the spec);
-here the VRAM-residency probe + total time give the practical crux signal.
-
-UNKNOWNS verified on first invoke (flagged, NOT assumed): ComfyUI+Ray persisting across warm invokes; clear_vram=False
-keeping the model resident; the exact on-volume model/input paths; whether RunPod sends SIGTERM(grace) or SIGKILL.
+NET-NEW path. Robust serverless design (2026-06-24, after a first deploy where workers exited unhealthy because
+module-load blocked on ComfyUI before runpod.serverless.start() registered):
+  - runpod.serverless.start() is called IMMEDIATELY at module-load so the worker registers healthy fast.
+  - ComfyUI+Raylight is launched in a BACKGROUND thread (non-blocking) and warms while the worker is healthy.
+  - EVERY file op is crash-guarded; telemetry falls back to /tmp if the volume isn't writable; key events print to
+    stdout (RunPod logs). handler(debug) returns full diagnostics (volume / models / env / GPU / comfy status)
+    WITHOUT needing ComfyUI, so failures are visible from a cheap debug invoke instead of an opaque worker exit.
+  - Parent process stays OFF the GPU (native fix: a ~730MB parent CUDA ctx tipped OOM); GPUs go to the ComfyUI
+    subprocess + Ray actors. clear_vram_after_sampling=False (the warm-residency lever).
 """
-import os, sys, time, json, glob, base64, signal, atexit, subprocess, threading, urllib.request, urllib.error
+import os, sys, time, json, glob, base64, traceback, subprocess, threading, urllib.request, urllib.error
 
-# Parent OFF the GPU; remember what RunPod assigned so we hand it to the ComfyUI subprocess only.
+
+def log(*a):
+    try: print("[handler]", *a, flush=True)
+    except Exception: pass
+
+
+# Parent OFF the GPU; remember RunPod's assignment for the ComfyUI subprocess.
 _NVIS = os.environ.get("CUDA_VISIBLE_DEVICES")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import runpod
@@ -44,20 +34,30 @@ ENDPOINT   = os.environ.get("RUNPOD_ENDPOINT_ID", "sl")
 PORT       = int(os.environ.get("COMFY_PORT", "8188"))
 URL        = f"http://127.0.0.1:{PORT}"
 WORKER_ID  = os.environ.get("RUNPOD_POD_ID") or os.environ.get("HOSTNAME") or f"pid{os.getpid()}"
-
-_BOOT_T = time.time()
-# module_load_epoch: unique per worker PROCESS — SAME across requests on a warm worker, NEW on every cold boot.
+_BOOT_T    = time.time()
 MODULE_EPOCH = f"{WORKER_ID}.{int(_BOOT_T)}.{os.getpid()}"
-WDIR = os.path.join(os.environ.get("TELE_DIR", f"{VOL}/serverless_telemetry"), ENDPOINT, WORKER_ID)
 
-_state = {"ready_t": None, "renders": 0, "comfy_pid": None}
+
+def _pick_tele_dir():
+    """Telemetry dir on the VOLUME if writable, else /tmp. Returns (dir, on_volume)."""
+    base = os.environ.get("TELE_DIR", f"{VOL}/serverless_telemetry")
+    cand = os.path.join(base, ENDPOINT, WORKER_ID)
+    try:
+        os.makedirs(cand, exist_ok=True)
+        p = os.path.join(cand, ".writetest"); open(p, "w").close(); os.remove(p)
+        return cand, True
+    except Exception as e:
+        log("VOLUME telemetry dir NOT writable:", repr(e))
+        alt = os.path.join("/tmp/sltele", ENDPOINT, WORKER_ID)
+        try: os.makedirs(alt, exist_ok=True)
+        except Exception: pass
+        return alt, False
+
+
+WDIR, VOL_WRITABLE = _pick_tele_dir()
 _comfy = None
-
-
-# --- low-level helpers -----------------------------------------------------------------------------------------
-def _mk(d):
-    try: os.makedirs(d, exist_ok=True)
-    except Exception: pass
+_comfy_state = {"phase": "not_started", "error": None, "ready": False, "pid": None, "started_t": None}
+_comfy_lock = threading.Lock()
 
 
 def _run(cmd, timeout=20):
@@ -71,154 +71,98 @@ def _n_gpus():
 
 
 def _vram_used():
-    """memory.used MiB per GPU — the VRAM-residency probe (warm worker should show the model still resident)."""
     out = _run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-    vals = []
+    v = []
     for ln in out.splitlines():
-        try: vals.append(int(ln.strip()))
+        try: v.append(int(ln.strip()))
         except Exception: pass
-    return vals
+    return v
 
 
-def _get(path, timeout=15):
+def _get(path, timeout=10):
     return json.loads(urllib.request.urlopen(URL + path, timeout=timeout).read().decode())
 
 
-def _beacon(kind, **rec):
-    """Append+fsync one JSONL line to the volume. Survives SIGKILL — the per-request/lifecycle safety net."""
-    _mk(WDIR)
-    line = {"kind": kind, "t": time.time(), "mono": time.monotonic(),
-            "endpoint": ENDPOINT, "worker_id": WORKER_ID, "epoch": MODULE_EPOCH, "ordinal": _state["renders"], **rec}
+def _tail(path, n=4000):
     try:
+        with open(path, "rb") as f:
+            f.seek(0, 2); sz = f.tell(); f.seek(max(0, sz - n))
+            return f.read().decode("utf-8", "replace")
+    except Exception as e:
+        return f"(no log: {e})"
+
+
+def _beacon(kind, **rec):
+    try:
+        line = {"kind": kind, "t": time.time(), "worker_id": WORKER_ID, "epoch": MODULE_EPOCH, **rec}
         with open(os.path.join(WDIR, "beacon.jsonl"), "a") as f:
             f.write(json.dumps(line) + "\n"); f.flush(); os.fsync(f.fileno())
     except Exception:
         pass
 
 
-# --- boot record: identity + dirty-GPU (prior-tenant residue, BEFORE we load anything) + arch fingerprint ------
-def _write_boot_record():
-    _mk(WDIR)
-    rec = {
-        "schema": 1, "endpoint": ENDPOINT, "worker_id": WORKER_ID, "epoch": MODULE_EPOCH,
-        "boot_wall": _BOOT_T, "pid": os.getpid(), "n_gpus": _n_gpus(),
-        "gpus": _run(["nvidia-smi", "--query-gpu=name,uuid,pcie.link.gen.max,memory.total",
-                      "--format=csv,noheader"]),
-        "nvlink": _run(["nvidia-smi", "nvlink", "-s"]),
-        "dirty_gpu_vram_used_mib": _vram_used(),                 # prior-tenant residue → OOM-by-150MB risk
-        "compute_apps_at_boot": _run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"]),
-        "cuda_visible_assigned": _NVIS,
-        "handler_arch": "persistent_server",                    # render runs IN the long-lived ComfyUI (no per-req subprocess)
-        "image_digest": os.environ.get("RUNPOD_IMAGE_NAME", ""),
-        "config_env": {k: v for k, v in os.environ.items()
-                       if k.startswith(("RUNPOD_", "MODEL_", "WORKERS", "IDLE", "FLASH", "CLEAR_VRAM"))},
-    }
-    try: json.dump(rec, open(os.path.join(WDIR, "identity.json"), "w"), indent=2)
-    except Exception: pass
-    _beacon("boot", dirty_vram=rec["dirty_gpu_vram_used_mib"], n_gpus=rec["n_gpus"])
-
-
-def _heartbeat():
-    """Idle heartbeat: disambiguates worker death-vs-alive and tracks VRAM residency across idle gaps."""
-    while True:
-        time.sleep(15)
-        _beacon("heartbeat", vram=_vram_used(), comfy_alive=(_comfy.poll() is None if _comfy else False))
-
-
-def _on_signal(sig, frame):
-    # SIGTERM marker present in the beacon => RunPod gave a grace window; absent => SIGKILL (per-req flush is the net).
-    _beacon("death", trigger="SIGTERM", signal=int(sig))
-    os._exit(0)
-
-
-# --- ComfyUI lifecycle -----------------------------------------------------------------------------------------
-def _launch_comfy():
+def _ensure_comfy(timeout=900):
+    """Launch ComfyUI+Raylight ONCE (idempotent). NON-fatal: any error is recorded in _comfy_state, never raised."""
     global _comfy
-    _mk(WDIR); _mk(OUTPUT_DIR)
-    n = _n_gpus()
-    env = dict(os.environ)
-    env["CUDA_VISIBLE_DEVICES"] = _NVIS if _NVIS else ",".join(str(i) for i in range(n))   # GPUs to ComfyUI/Ray
-    env["COMFY_DIR"] = COMFY_DIR
-    # Baked ComfyUI finds the ~18GB model set on the mounted VOLUME via an extra-model-paths config (models not baked).
-    cargs = f"--input-directory {INPUTS_DIR} --output-directory {OUTPUT_DIR}"
-    emp = os.environ.get("EXTRA_MODEL_PATHS", "/opt/extra_model_paths.yaml")
-    if emp and os.path.exists(emp):
-        cargs += f" --extra-model-paths-config {emp}"
-    env["COMFY_ARGS"] = cargs
-    env["PYTHONUNBUFFERED"] = "1"
-    boot_log = open(os.path.join(WDIR, "comfy.log"), "ab", buffering=0)
-    _beacon("comfy_launch")
-    _comfy = subprocess.Popen([sys.executable, os.path.join(HERE, "comfy_launch.py")],
-                              env=env, stdout=boot_log, stderr=subprocess.STDOUT, cwd=COMFY_DIR)
-    _state["comfy_pid"] = _comfy.pid
+    with _comfy_lock:
+        if _comfy_state["ready"]:
+            return True
+        if _comfy_state["phase"] in ("launching", "error", "timeout", "exception"):
+            # another caller is launching, or it already failed; just wait/return current state
+            pass
+        if _comfy is None and _comfy_state["phase"] in ("not_started", "launching"):
+            _comfy_state["phase"] = "launching"; _comfy_state["started_t"] = time.time()
+            start_now = True
+        else:
+            start_now = False
+    if start_now:
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            n = _n_gpus()
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = _NVIS if _NVIS else ",".join(str(i) for i in range(n))
+            env["COMFY_DIR"] = COMFY_DIR
+            cargs = f"--input-directory {INPUTS_DIR} --output-directory {OUTPUT_DIR}"
+            emp = os.environ.get("EXTRA_MODEL_PATHS", "/opt/extra_model_paths.yaml")
+            if emp and os.path.exists(emp):
+                cargs += f" --extra-model-paths-config {emp}"
+            env["COMFY_ARGS"] = cargs
+            env["PYTHONUNBUFFERED"] = "1"
+            logp = os.path.join(WDIR, "comfy.log")
+            try: out_f = open(logp, "ab", buffering=0)
+            except Exception: out_f = None
+            log(f"launching ComfyUI: COMFY_DIR={COMFY_DIR} args={cargs} gpus={env['CUDA_VISIBLE_DEVICES']}")
+            _comfy = subprocess.Popen([sys.executable, os.path.join(HERE, "comfy_launch.py")],
+                                      env=env, cwd=COMFY_DIR,
+                                      stdout=(out_f or subprocess.DEVNULL), stderr=subprocess.STDOUT)
+            _comfy_state["pid"] = _comfy.pid
+            _beacon("comfy_launch", pid=_comfy.pid)
+        except Exception:
+            _comfy_state["phase"] = "exception"; _comfy_state["error"] = traceback.format_exc()
+            log("ensure_comfy launch EXCEPTION:", _comfy_state["error"]); return False
+    # wait for readiness (any caller)
     t0 = time.time()
-    while time.time() - t0 < 900:
+    while time.time() - t0 < timeout:
+        if _comfy_state["ready"]:
+            return True
         try:
             _get("/system_stats", timeout=5)
-            _state["ready_t"] = time.time()
-            _beacon("comfy_ready", boot_to_ready_s=round(_state["ready_t"] - _BOOT_T, 1), comfy_pid=_comfy.pid)
-            return
+            _comfy_state["ready"] = True; _comfy_state["phase"] = "ready"
+            log(f"ComfyUI READY in {round(time.time()-(_comfy_state['started_t'] or t0),1)}s")
+            _beacon("comfy_ready", boot_to_ready_s=round(time.time() - _BOOT_T, 1))
+            return True
         except Exception:
-            if _comfy.poll() is not None:
-                _beacon("comfy_exit_during_boot", rc=_comfy.returncode)
-                raise RuntimeError(f"ComfyUI exited during boot (rc={_comfy.returncode}) — see {boot_log.name}")
+            if _comfy is not None and _comfy.poll() is not None:
+                _comfy_state["phase"] = "error"
+                _comfy_state["error"] = f"ComfyUI exited rc={_comfy.returncode}. log tail:\n{_tail(os.path.join(WDIR,'comfy.log'))}"
+                log("ComfyUI EXITED:", _comfy_state["error"]); _beacon("comfy_exit", rc=_comfy.returncode)
+                return False
             time.sleep(2)
-    raise RuntimeError("ComfyUI did not become ready within 900s")
-
-
-def _build_wf(job, n):
-    wf = json.load(open(WF_PATH))
-    length = int(job.get("frame_num", 81))
-    steps  = int(job.get("sample_steps", 6))
-    w, h   = int(job.get("width", 720)), int(job.get("height", 1280))
-    wf["1"]["inputs"]["GPU"] = n
-    wf["1"]["inputs"]["ulysses_degree"] = n
-    wf["1"]["inputs"]["clear_vram_after_sampling"] = False   # WARM LEVER — keep model resident across requests
-    for node, key in (("9", "src_video"), ("10", "src_mask")):
-        if job.get(key):
-            wf[node]["inputs"]["video"] = os.path.basename(job[key])
-        wf[node]["inputs"]["custom_width"], wf[node]["inputs"]["custom_height"] = w, h
-        wf[node]["inputs"]["frame_load_cap"] = length
-    if job.get("src_ref_images"):
-        wf["12"]["inputs"]["image"] = os.path.basename(job["src_ref_images"])
-    for nd in ("13", "14"):
-        wf[nd]["inputs"]["width"], wf[nd]["inputs"]["height"] = w, h
-    wf["14"]["inputs"]["length"] = length
-    wf["15"]["inputs"]["steps"] = steps
-    if job.get("prompt"):
-        wf["7"]["inputs"]["text"] = job["prompt"]
-    wf["18"]["inputs"]["filename_prefix"] = f"SLBENCH/{WORKER_ID}_{int(time.time())}"
-    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n}
-
-
-# --- render telemetry hook (v1 light 1 Hz curve; FULL §1-§2c render capture wires in HERE from the spec) -------
-def _render_telemetry_start(reqdir):
-    stop = threading.Event()
-    def sample():
-        try:
-            f = open(os.path.join(reqdir, "gpu_1hz.csv"), "w", buffering=1)
-        except Exception:
-            return
-        f.write("t,gpu_util,vram_mib,power_w\n")
-        q = "nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv,noheader,nounits".split()
-        while not stop.is_set():
-            lines = _run(q).splitlines()
-            f.write(f"{time.time():.1f},{lines[0].replace(' ', '') if lines else ''}\n")
-            stop.wait(1.0)
-        f.close()
-    threading.Thread(target=sample, daemon=True).start()
-    return stop
-
-
-def _render_telemetry_stop(stop):
-    if stop: stop.set()
-    time.sleep(0.2)   # let the last sample flush to the volume
+    _comfy_state["phase"] = "timeout"; _comfy_state["error"] = "ComfyUI not ready within timeout"
+    return False
 
 
 def _debug_models():
-    """Resolve the workflow's models from INSIDE the worker (follows symlinks; S3 can't). The volume's GGUF+LoRA are
-    symlinks → if their target is an absolute /workspace path (the pod mount), they break under /runpod-volume. This
-    reports exists / is_symlink / realpath / real_exists / size so a free debug invoke nails it before any render."""
     base = os.path.join(VOL, "runpod-slim", "ComfyUI", "models")
     want = {
         "gguf":     os.path.join(base, "unet", "gguf", "wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf"),
@@ -235,38 +179,69 @@ def _debug_models():
                       "realpath": real, "real_exists": (os.path.exists(real) if real else False),
                       "size": (os.path.getsize(p) if os.path.exists(p) else None)}
         except Exception as e:
-            out[k] = {"path": p, "err": str(e)}
-    out["_listings"] = {}
-    for d in (os.path.join(base, "unet", "gguf"), os.path.join(base, "loras"),
-              os.path.join(base, "clip"), os.path.join(base, "text_encoders"), os.path.join(base, "vae")):
-        try: out["_listings"][d] = sorted(os.listdir(d))[:25]
-        except Exception as e: out["_listings"][d] = f"ERR {e}"
+            out[k] = {"path": p, "err": repr(e)}
     return out
+
+
+def _debug():
+    """Full diagnostics — does NOT need ComfyUI. Surfaces the exact reason a render would fail."""
+    d = {
+        "worker_id": WORKER_ID, "epoch": MODULE_EPOCH, "boot_to_now_s": round(time.time() - _BOOT_T, 1),
+        "handler_arch": "persistent_server_lazy", "n_gpus": _n_gpus(), "vram_used_mib": _vram_used(),
+        "telemetry_dir": WDIR, "telemetry_on_volume": VOL_WRITABLE,
+        "comfy": dict(_comfy_state),
+        "env_runpod": {k: v for k, v in os.environ.items() if k.startswith(("RUNPOD_", "MODEL_"))},
+        "paths": {"VOL": VOL, "vol_exists": os.path.isdir(VOL),
+                  "comfy_dir": COMFY_DIR, "comfy_dir_exists": os.path.isdir(COMFY_DIR),
+                  "inputs_dir": INPUTS_DIR, "inputs_dir_exists": os.path.isdir(INPUTS_DIR),
+                  "wf_path": WF_PATH, "wf_exists": os.path.exists(WF_PATH)},
+    }
+    try: d["vol_listing"] = sorted(os.listdir(VOL))[:25]
+    except Exception as e: d["vol_listing"] = f"ERR {e}"
+    d["models"] = _debug_models()
+    if _comfy_state.get("phase") in ("error", "exception", "timeout"):
+        d["comfy_log_tail"] = _tail(os.path.join(WDIR, "comfy.log"))
+    return d
+
+
+def _build_wf(job, n):
+    wf = json.load(open(WF_PATH))
+    length = int(job.get("frame_num", 81)); steps = int(job.get("sample_steps", 6))
+    w, h = int(job.get("width", 720)), int(job.get("height", 1280))
+    wf["1"]["inputs"]["GPU"] = n
+    wf["1"]["inputs"]["ulysses_degree"] = n
+    wf["1"]["inputs"]["clear_vram_after_sampling"] = False
+    for node, key in (("9", "src_video"), ("10", "src_mask")):
+        if job.get(key): wf[node]["inputs"]["video"] = os.path.basename(job[key])
+        wf[node]["inputs"]["custom_width"], wf[node]["inputs"]["custom_height"] = w, h
+        wf[node]["inputs"]["frame_load_cap"] = length
+    if job.get("src_ref_images"): wf["12"]["inputs"]["image"] = os.path.basename(job["src_ref_images"])
+    for nd in ("13", "14"): wf[nd]["inputs"]["width"], wf[nd]["inputs"]["height"] = w, h
+    wf["14"]["inputs"]["length"] = length
+    wf["15"]["inputs"]["steps"] = steps
+    if job.get("prompt"): wf["7"]["inputs"]["text"] = job["prompt"]
+    wf["18"]["inputs"]["filename_prefix"] = f"SLBENCH/{WORKER_ID}_{int(time.time())}"
+    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n}
 
 
 def handler(event):
     job = (event or {}).get("input", {}) or {}
     if job.get("debug"):
-        return {"worker_id": WORKER_ID, "epoch": MODULE_EPOCH, "handler_arch": "persistent_server",
-                "n_gpus": _n_gpus(), "comfy_ready": _state["ready_t"] is not None,
-                "renders_on_this_worker": _state["renders"], "vram_now": _vram_used(),
-                "boot_to_ready_s": (_state["ready_t"] or _BOOT_T) - _BOOT_T,
-                "models": _debug_models()}
+        return _debug()
     if not job.get("prompt"):
         return {"error": "prompt is required"}
 
-    cold = (_state["renders"] == 0)                     # cold = first render on this worker (pays the dequant)
-    n = int(job.get("n_gpus") or _n_gpus())
-    jid = (event or {}).get("id") or f"{WORKER_ID}_{_state['renders']}"
+    cold = not _comfy_state["ready"]
     vram_entry = _vram_used()
-    resident = bool(vram_entry and max(vram_entry) > 8000)   # >8GB => dequantized GGUF likely resident (warm)
     t_entry = time.time()
-    _beacon("req_entry", job_id=jid, cold=cold, n_gpus=n, vram_entry=vram_entry,
-            model_resident_at_entry=resident, worker_age_s=round(t_entry - _BOOT_T, 1))
+    if not _ensure_comfy():
+        return {"error": "ComfyUI not available", "comfy": dict(_comfy_state),
+                "comfy_log_tail": _tail(os.path.join(WDIR, "comfy.log")), "worker_id": WORKER_ID}
 
-    reqdir = os.path.join(WDIR, str(jid)); _mk(reqdir)
+    n = int(job.get("n_gpus") or _n_gpus())
+    jid = (event or {}).get("id") or f"{WORKER_ID}_{int(time.time())}"
+    _beacon("req_entry", job_id=jid, cold=cold, n_gpus=n, vram_entry=vram_entry)
     wf, meta = _build_wf(job, n)
-    stop = _render_telemetry_start(reqdir)
     t_submit = time.time()
     try:
         body = json.dumps({"prompt": wf, "client_id": str(jid)}).encode()
@@ -274,10 +249,7 @@ def handler(event):
         try:
             pid = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())["prompt_id"]
         except urllib.error.HTTPError as e:
-            err = e.read().decode()[:1500]
-            _beacon("req_error", job_id=jid, stage="submit", detail=err[:300])
-            return {"error": "workflow validation failed", "detail": err, "cold": cold, "worker_id": WORKER_ID}
-
+            return {"error": "workflow validation failed", "detail": e.read().decode()[:1500], "worker_id": WORKER_ID}
         err = None
         while time.time() - t_submit < 2400:
             time.sleep(3)
@@ -285,52 +257,28 @@ def handler(event):
             except Exception: continue
             if pid in h:
                 st = h[pid].get("status", {})
-                if st.get("status_str") != "success":
-                    err = json.dumps(st.get("messages", []))[:1500]
+                if st.get("status_str") != "success": err = json.dumps(st.get("messages", []))[:1500]
                 break
         t_done = time.time()
         vram_exit = _vram_used()
-
         mp4s = sorted(glob.glob(os.path.join(OUTPUT_DIR, wf["18"]["inputs"]["filename_prefix"] + "*.mp4")))
-        out = {
-            "worker_id": WORKER_ID, "epoch": MODULE_EPOCH, "job_id": jid, "ordinal": _state["renders"],
-            "cold": cold, "model_resident_at_entry": resident,                 # consensus inputs for the class label
-            "worker_age_s": round(t_entry - _BOOT_T, 1),
-            "boot_to_ready_s": round((_state["ready_t"] or _BOOT_T) - _BOOT_T, 1),
-            "total_s": round(t_done - t_submit, 1),       # cold ~= dequant + sample; warm-resident ~= sample only
-            "vram_entry_mib": vram_entry, "vram_exit_mib": vram_exit, **meta,
-        }
-        if err:
-            out["error"] = "render failed"; out["detail"] = err
+        out = {"worker_id": WORKER_ID, "epoch": MODULE_EPOCH, "job_id": jid, "cold": cold,
+               "total_s": round(t_done - t_submit, 1), "vram_entry_mib": vram_entry, "vram_exit_mib": vram_exit, **meta}
+        if err: out["error"] = "render failed"; out["detail"] = err
         elif mp4s:
-            data = open(mp4s[-1], "rb").read()
-            out["bytes"] = len(data)
-            # TODO(long clips): switch to an S3 URL once outputs exceed the response ceiling (spec G).
+            data = open(mp4s[-1], "rb").read(); out["bytes"] = len(data)
             out["video_base64"] = base64.b64encode(data).decode()
         else:
             out["error"] = "no output produced"
-
-        # durable per-request record: write *.partial then atomic os.replace (survives an idle-out mid-write)
-        rec = {k: v for k, v in out.items() if k != "video_base64"}
-        tmp = os.path.join(reqdir, "request.json.partial")
-        try:
-            json.dump(rec, open(tmp, "w"), indent=2); os.replace(tmp, os.path.join(reqdir, "request.json"))
-        except Exception:
-            pass
-        _beacon("req_exit", job_id=jid, total_s=out["total_s"], ok=("error" not in out),
-                bytes=out.get("bytes"), vram_exit=vram_exit, model_resident_at_entry=resident)
+        _beacon("req_exit", job_id=jid, total_s=out["total_s"], ok=("error" not in out), vram_exit=vram_exit)
         return out
-    finally:
-        _render_telemetry_stop(stop)
-        _state["renders"] += 1
+    except Exception:
+        return {"error": "handler exception", "trace": traceback.format_exc(), "worker_id": WORKER_ID}
 
 
-# --- module load: capture dirty-GPU/identity FIRST, then launch the persistent worker, then serve --------------
-atexit.register(lambda: _beacon("death", trigger="atexit"))
-try: signal.signal(signal.SIGTERM, _on_signal)
-except Exception: pass
-
-_write_boot_record()                 # BEFORE ComfyUI touches the GPU (captures prior-tenant dirty VRAM)
-threading.Thread(target=_heartbeat, daemon=True).start()
-_launch_comfy()                      # persistent ComfyUI+Ray so a warm worker keeps the model resident
+# --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
+log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "
+    f"vol_exists={os.path.isdir(VOL)} comfy_dir_exists={os.path.isdir(COMFY_DIR)}")
+_beacon("boot", on_volume=VOL_WRITABLE, vol_exists=os.path.isdir(VOL))
+threading.Thread(target=_ensure_comfy, daemon=True).start()   # warm in background; NEVER blocks start()
 runpod.serverless.start({"handler": handler})

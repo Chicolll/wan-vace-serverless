@@ -276,6 +276,17 @@ def handler(event):
         return {"error": "handler exception", "trace": traceback.format_exc(), "worker_id": WORKER_ID}
 
 
+# The volume's ComfyUI model files are symlinks to /workspace/hf-cache/... (the POD mount point). On serverless the
+# volume mounts at /runpod-volume, so those symlinks dangle. Make /workspace resolve to the volume → every model
+# symlink (gguf / lora / clip / vae, all under hf-cache/) resolves to the real blob in one shot. MUST run before ComfyUI.
+try:
+    if not os.path.lexists("/workspace"):
+        os.symlink(VOL, "/workspace"); log("linked /workspace ->", VOL)
+    else:
+        log("/workspace already exists ->", os.path.realpath("/workspace"))
+except Exception as e:
+    log("workspace symlink failed:", repr(e))
+
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "
     f"vol_exists={os.path.isdir(VOL)} comfy_dir_exists={os.path.isdir(COMFY_DIR)}")

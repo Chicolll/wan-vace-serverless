@@ -29,8 +29,12 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
 COPY raylight_full_install.sh /opt/raylight_full_install.sh
 RUN COMFY_DIR=/opt/ComfyUI bash /opt/raylight_full_install.sh; tail -n 60 /root/install.log || true
 
-# Hard build-time import gate — a broken dep fails the BUILD, never a live (metered) worker.
-RUN python3.11 -c "import torch, xfuser, ray, diffusers, transformers, yunchang; \
+# The serverless handler needs the `runpod` python SDK — NOT in the Raylight recipe (the native image installed it
+# separately). Missing it = `import runpod` crashes every worker on boot before it can register. Install it here.
+RUN python3.11 -m pip install runpod
+
+# Hard build-time import gate — a broken dep (INCLUDING runpod) fails the BUILD, never a live (metered) worker.
+RUN python3.11 -c "import torch, xfuser, ray, diffusers, transformers, yunchang, runpod; \
 print('IMG_ENV_OK', torch.__version__, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
 
 # Handler + launcher + workflow + model-path map (models themselves mount from the volume at runtime).

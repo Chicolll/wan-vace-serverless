@@ -215,13 +215,43 @@ def _render_telemetry_stop(stop):
     time.sleep(0.2)   # let the last sample flush to the volume
 
 
+def _debug_models():
+    """Resolve the workflow's models from INSIDE the worker (follows symlinks; S3 can't). The volume's GGUF+LoRA are
+    symlinks → if their target is an absolute /workspace path (the pod mount), they break under /runpod-volume. This
+    reports exists / is_symlink / realpath / real_exists / size so a free debug invoke nails it before any render."""
+    base = os.path.join(VOL, "runpod-slim", "ComfyUI", "models")
+    want = {
+        "gguf":     os.path.join(base, "unet", "gguf", "wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf"),
+        "lora":     os.path.join(base, "loras", "Wan2.1_T2V_14B_FusionX_LoRA.safetensors"),
+        "clip":     os.path.join(base, "clip", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
+        "clip_alt": os.path.join(base, "text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
+        "vae":      os.path.join(base, "vae", "wan_2.1_vae.safetensors"),
+    }
+    out = {}
+    for k, p in want.items():
+        try:
+            lex = os.path.lexists(p); real = os.path.realpath(p) if lex else None
+            out[k] = {"path": p, "exists": os.path.exists(p), "is_symlink": os.path.islink(p) if lex else False,
+                      "realpath": real, "real_exists": (os.path.exists(real) if real else False),
+                      "size": (os.path.getsize(p) if os.path.exists(p) else None)}
+        except Exception as e:
+            out[k] = {"path": p, "err": str(e)}
+    out["_listings"] = {}
+    for d in (os.path.join(base, "unet", "gguf"), os.path.join(base, "loras"),
+              os.path.join(base, "clip"), os.path.join(base, "text_encoders"), os.path.join(base, "vae")):
+        try: out["_listings"][d] = sorted(os.listdir(d))[:25]
+        except Exception as e: out["_listings"][d] = f"ERR {e}"
+    return out
+
+
 def handler(event):
     job = (event or {}).get("input", {}) or {}
     if job.get("debug"):
         return {"worker_id": WORKER_ID, "epoch": MODULE_EPOCH, "handler_arch": "persistent_server",
                 "n_gpus": _n_gpus(), "comfy_ready": _state["ready_t"] is not None,
                 "renders_on_this_worker": _state["renders"], "vram_now": _vram_used(),
-                "boot_to_ready_s": (_state["ready_t"] or _BOOT_T) - _BOOT_T}
+                "boot_to_ready_s": (_state["ready_t"] or _BOOT_T) - _BOOT_T,
+                "models": _debug_models()}
     if not job.get("prompt"):
         return {"error": "prompt is required"}
 

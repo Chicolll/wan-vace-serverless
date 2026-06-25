@@ -1,8 +1,8 @@
 # Serverless worker image — Raylight (ComfyUI + Wan2.1-VACE-14B Q4 GGUF + FusionX) USP render.
 #
-# Mirrors the native lean-image pattern: bakes env + ComfyUI + the custom nodes the workflow uses (~18GB). The ~18GB
-# MODEL set is NOT baked (same 85GB export wall that killed the native bake) — it comes from the mounted network
-# volume at runtime via /opt/extra_model_paths.yaml. Reconstructs the PROVEN pod recipe (raylight_full_install.sh:
+# Mirrors the native lean-image pattern: bakes env + ComfyUI + the custom nodes the workflow uses (~18GB). The 4
+# workflow MODELS (~19GB Q4 GGUF set) ARE now baked onto local disk (bake_models.py) — the 85GB wall was the bf16
+# native model, NOT this quant; baking kills the per-cold network-volume read. Reconstructs the PROVEN pod recipe (raylight_full_install.sh:
 # torch 2.6 + ray + xfuser + node reqs + pins transformers 4.49 / diffusers 0.33 / nccl 2.28.9 / numpy<2) into
 # SYSTEM python3.11. Build for linux/amd64 (RunPod arch).
 #
@@ -36,6 +36,16 @@ RUN python3.11 -m pip install runpod
 # Hard build-time import gate — a broken dep (INCLUDING runpod) fails the BUILD, never a live (metered) worker.
 RUN python3.11 -c "import torch, xfuser, ray, diffusers, transformers, yunchang, runpod; \
 print('IMG_ENV_OK', torch.__version__, 'diffusers', diffusers.__version__, 'transformers', transformers.__version__)"
+
+# Bake the 4 workflow models onto the image's LOCAL disk (~19GB): no per-cold-start network-volume read — the ~115s
+# MooseFS read that dominated cold load is gone (cold = dequant + Ray init only). Sidesteps RunPod's one-cached-model
+# limit (4 files / 3 repos). Public HF, sha256-verified; a mismatch FAILS the build. hf_transfer speeds the pull;
+# HF_HOME + temp dir are cleaned in-layer so only the baked files remain. The handler finds these local files ahead
+# of the volume (no code change needed — _setup_models keeps existing real dirs and only symlinks missing ones).
+COPY bake_models.py /opt/bake_models.py
+RUN python3.11 -m pip install --no-cache-dir huggingface_hub hf_transfer && \
+    HF_HUB_ENABLE_HF_TRANSFER=1 HF_HOME=/tmp/hfhome COMFY_DIR=/opt/ComfyUI python3.11 /opt/bake_models.py && \
+    rm -rf /tmp/hfhome /tmp/bake_dl
 
 # Handler + launcher + workflow + model-path map (models themselves mount from the volume at runtime).
 COPY handler_raylight.py   /opt/handler_raylight.py

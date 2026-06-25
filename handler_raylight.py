@@ -101,6 +101,22 @@ def _beacon(kind, **rec):
         pass
 
 
+def _hwtele(action, name=""):
+    """FULL hardware telemetry via pod_telemetry.sh — the complete signal set (per-GPU sm%/mem-bw%/PCIe/NVLink/power/
+    clocks/VRAM, CPU% + per-core, RAM, disk read/write, and NETWORK-volume RX rate, + per-process). The continuous
+    net.csv (volume read) vs sys.csv/percpu.csv (CPU) split the cold load into VOLUME-READ vs Q4->bf16 DEQUANT — the
+    thing the bare beacon couldn't show. Writes to WDIR/hw/. Crash-guarded; niced loggers never block the render."""
+    try:
+        script = os.path.join(HERE, "pod_telemetry.sh")
+        if not os.path.exists(script):
+            log("hwtele: pod_telemetry.sh missing at", script); return
+        env = dict(os.environ); env["TELE_DIR"] = WDIR
+        subprocess.Popen(["bash", script, action, "hw"] + ([name] if name else []),
+                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log("hwtele", action, "failed:", repr(e))
+
+
 def _ensure_comfy(timeout=900):
     """Launch ComfyUI+Raylight ONCE (idempotent). NON-fatal: any error is recorded in _comfy_state, never raised."""
     global _comfy
@@ -256,6 +272,7 @@ def handler(event):
     n = int(job.get("n_gpus") or _n_gpus())
     jid = (event or {}).get("id") or f"{WORKER_ID}_{int(time.time())}"
     _beacon("req_entry", job_id=jid, cold=cold, n_gpus=n, vram_entry=vram_entry)
+    _hwtele("phase", f"req_entry:{jid}:cold={cold}:n={n}")
     wf, meta = _build_wf(job, n)
     t_submit = time.time()
     try:
@@ -286,6 +303,8 @@ def handler(event):
         else:
             out["error"] = "no output produced"
         _beacon("req_exit", job_id=jid, total_s=out["total_s"], ok=("error" not in out), vram_exit=vram_exit)
+        _hwtele("phase", f"req_exit:{jid}:ok={'error' not in out}")
+        _hwtele("save")
         return out
     except Exception:
         return {"error": "handler exception", "trace": traceback.format_exc(), "worker_id": WORKER_ID}
@@ -330,5 +349,6 @@ _bind("input",  INPUTS_DIR)
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "
     f"vol_exists={os.path.isdir(VOL)} comfy_dir_exists={os.path.isdir(COMFY_DIR)}")
 _beacon("boot", on_volume=VOL_WRITABLE, vol_exists=os.path.isdir(VOL))
+_hwtele("start")   # full hw telemetry running BEFORE ComfyUI launches → captures the cold load (read vs dequant)
 threading.Thread(target=_ensure_comfy, daemon=True).start()   # warm in background; NEVER blocks start()
 runpod.serverless.start({"handler": handler})

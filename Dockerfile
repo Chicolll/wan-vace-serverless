@@ -40,6 +40,7 @@ print('IMG_ENV_OK', torch.__version__, 'diffusers', diffusers.__version__, 'tran
 # Handler + launcher + workflow + model-path map (models themselves mount from the volume at runtime).
 COPY handler_raylight.py   /opt/handler_raylight.py
 COPY comfy_launch.py       /opt/comfy_launch.py
+COPY pod_telemetry.sh      /opt/pod_telemetry.sh
 COPY raylight_vace_wf.json /opt/raylight_vace_wf.json
 COPY extra_model_paths.yaml /opt/extra_model_paths.yaml
 

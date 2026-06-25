@@ -11,7 +11,7 @@ module-load blocked on ComfyUI before runpod.serverless.start() registered):
   - Parent process stays OFF the GPU (native fix: a ~730MB parent CUDA ctx tipped OOM); GPUs go to the ComfyUI
     subprocess + Ray actors. clear_vram_after_sampling=False (the warm-residency lever).
 """
-import os, sys, time, json, glob, base64, traceback, subprocess, threading, urllib.request, urllib.error
+import os, sys, time, json, glob, base64, traceback, subprocess, threading, shutil, urllib.request, urllib.error
 
 
 def log(*a):
@@ -29,7 +29,7 @@ COMFY_DIR  = os.environ.get("COMFY_DIR", "/opt/ComfyUI")
 HERE       = os.path.dirname(os.path.abspath(__file__))
 WF_PATH    = os.environ.get("WF_PATH", os.path.join(HERE, "raylight_vace_wf.json"))
 INPUTS_DIR = os.environ.get("INPUTS_DIR", f"{VOL}/native-xdit/inputs")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/slout")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", f"{COMFY_DIR}/output")  # ComfyUI's DEFAULT — robust to --output-directory being ignored
 ENDPOINT   = os.environ.get("RUNPOD_ENDPOINT_ID", "sl")
 PORT       = int(os.environ.get("COMFY_PORT", "8188"))
 URL        = f"http://127.0.0.1:{PORT}"
@@ -183,6 +183,20 @@ def _debug_models():
     return out
 
 
+def _comfy_dirs():
+    """What ComfyUI will actually SCAN — confirms the model/input binds took (verify via cheap debug, pre-render)."""
+    out = {}
+    for sub in ("models", "models/vae", "models/text_encoders", "models/clip", "models/loras", "models/unet/gguf", "input"):
+        p = os.path.join(COMFY_DIR, sub)
+        try:
+            top = os.path.join(COMFY_DIR, sub.split("/")[0])
+            out[sub] = {"is_link": os.path.islink(top), "real": os.path.realpath(p) if os.path.lexists(p) else None,
+                        "exists": os.path.isdir(p), "entries": sorted(os.listdir(p))[:10] if os.path.isdir(p) else None}
+        except Exception as e:
+            out[sub] = {"err": repr(e)}
+    return out
+
+
 def _debug():
     """Full diagnostics — does NOT need ComfyUI. Surfaces the exact reason a render would fail."""
     d = {
@@ -199,6 +213,7 @@ def _debug():
     try: d["vol_listing"] = sorted(os.listdir(VOL))[:25]
     except Exception as e: d["vol_listing"] = f"ERR {e}"
     d["models"] = _debug_models()
+    d["comfy_dirs"] = _comfy_dirs()
     if _comfy_state.get("phase") in ("error", "exception", "timeout"):
         d["comfy_log_tail"] = _tail(os.path.join(WDIR, "comfy.log"))
     return d
@@ -288,6 +303,28 @@ try:
     log("workspace/hf-cache ->", os.path.realpath(_hf), "resolves:", os.path.exists(_hf))
 except Exception as e:
     log("hf-cache link failed:", repr(e))
+
+# ComfyUI must SCAN the volume's model + input trees. The --extra-model-paths-config / --input-directory launch args
+# did NOT take effect (first render failed validation: empty model lists + "invalid input file"), so bind ComfyUI's
+# OWN default dirs to the volume directly: replace the baked (empty placeholder) /opt/ComfyUI/{models,input} with
+# symlinks to the volume. The volume's models/* entries are themselves symlinks into hf-cache, resolved by the
+# /workspace/hf-cache link above. MUST run before the ComfyUI thread starts (i.e. before scanning).
+def _bind(sub, target):
+    try:
+        link = os.path.join(COMFY_DIR, sub)
+        if not os.path.isdir(target):
+            log(f"bind {sub}: target MISSING {target}"); return
+        if os.path.islink(link):
+            log(f"bind {sub}: already a link -> {os.path.realpath(link)}"); return
+        if os.path.exists(link):
+            shutil.rmtree(link, ignore_errors=True)
+        os.symlink(target, link)
+        log(f"bind {sub} -> {os.path.realpath(link)} (entries={len(os.listdir(link))})")
+    except Exception as e:
+        log(f"bind {sub} failed:", repr(e))
+
+_bind("models", os.path.join(VOL, "runpod-slim", "ComfyUI", "models"))
+_bind("input",  INPUTS_DIR)
 
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "

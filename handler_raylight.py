@@ -342,7 +342,73 @@ def _bind(sub, target):
     except Exception as e:
         log(f"bind {sub} failed:", repr(e))
 
-_bind("models", os.path.join(VOL, "runpod-slim", "ComfyUI", "models"))
+# --- HOST-NVMe MODEL CACHE (the cold-load lever) ---------------------------------------------------------------
+# The cold load is ~80% network-volume READ (~115s of ~140s on H100). RunPod's cached-model feature stages an HF
+# repo onto host-local NVMe at /runpod/model-store/huggingface/<repo>/.../<file> (the native 75GB path's <1s mmap).
+# So instead of one wholesale models->volume symlink, build a real models dir where EVERY model resolves from the
+# volume by default (unchanged discovery + reads), but the 4 files the workflow loads PREFER the host-NVMe copy
+# when RunPod has cached it. The net.csv->disk.csv read shift on the next cold render is the proof the cache works.
+# SAFE FALLBACK: no cache registered => _hoststore returns None for all => behaviour identical to the old volume bind.
+VOL_MODELS = os.path.join(VOL, "runpod-slim", "ComfyUI", "models")
+MODELS_DIR = os.path.join(COMFY_DIR, "models")
+# (ComfyUI-relative path under models/, HF repo that RunPod caches it from). Repos verified from the download manifest.
+CACHED_MODELS = [
+    ("unet/gguf/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf", "mickmumpitz/VACE_Skyreels_V3_R2V_Merge-GGUF"),
+    ("loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors",                "DeepBeepMeep/Wan2.1"),
+    ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",         "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+    ("vae/wan_2.1_vae.safetensors",                                  "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+]
+
+def _hoststore(repo, basename):
+    """Path to a cached HF file on host NVMe, else None. RunPod layout: /runpod/model-store/huggingface/<repo>/<rev>/
+    snapshots/<rev>/<file> (confirmed from the native run logs); glob by basename covers the snapshot + flat forms."""
+    hits = glob.glob(f"/runpod/model-store/huggingface/{repo}/**/{basename}", recursive=True)
+    return hits[0] if hits else None
+
+def _mirror_into(real_dir, vol_dir):
+    """Make real_dir a real directory and symlink each entry of vol_dir into it, so all sibling models stay
+    discoverable (the volume entries are themselves hf-cache symlinks = the network read = the fallback path)."""
+    os.makedirs(real_dir, exist_ok=True)
+    if os.path.isdir(vol_dir):
+        for name in os.listdir(vol_dir):
+            d = os.path.join(real_dir, name)
+            if not os.path.lexists(d):
+                os.symlink(os.path.join(vol_dir, name), d)
+
+def _setup_models():
+    """Per-file source selection for /opt/ComfyUI/models: volume by default; the 4 workflow models prefer host NVMe."""
+    try:
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        # default: wholesale-symlink every volume model subdir (full discovery, volume reads — old behaviour)
+        if os.path.isdir(VOL_MODELS):
+            for name in os.listdir(VOL_MODELS):
+                d = os.path.join(MODELS_DIR, name)
+                if not os.path.lexists(d):
+                    os.symlink(os.path.join(VOL_MODELS, name), d)
+        else:
+            log("setup_models: VOL_MODELS MISSING", VOL_MODELS)
+        # override the 4 workflow models: walk parents top-down, converting volume-symlinked dirs into real mirror
+        # dirs so a single file can be replaced, then point the leaf at host NVMe when cached (else leave volume).
+        for rel, repo in CACHED_MODELS:
+            parts = rel.split("/")
+            cur, volcur = MODELS_DIR, VOL_MODELS
+            for comp in parts[:-1]:
+                cur, volcur = os.path.join(cur, comp), os.path.join(volcur, comp)
+                if os.path.islink(cur):
+                    os.unlink(cur); _mirror_into(cur, volcur)
+                elif not os.path.isdir(cur):
+                    _mirror_into(cur, volcur)
+            hs = _hoststore(repo, os.path.basename(rel))
+            leaf = os.path.join(MODELS_DIR, *parts)
+            if hs:
+                if os.path.lexists(leaf):
+                    os.unlink(leaf)
+                os.symlink(hs, leaf)
+            log(f"model {rel} <- {('HOST-NVMe ' + hs) if hs else 'volume (cache miss)'}")
+    except Exception as e:
+        log("setup_models failed:", repr(e))
+
+_setup_models()
 _bind("input",  INPUTS_DIR)
 
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---

@@ -360,10 +360,19 @@ CACHED_MODELS = [
 ]
 
 def _hoststore(repo, basename):
-    """Path to a cached HF file on host NVMe, else None. RunPod layout: /runpod/model-store/huggingface/<repo>/<rev>/
-    snapshots/<rev>/<file> (confirmed from the native run logs); glob by basename covers the snapshot + flat forms."""
-    hits = glob.glob(f"/runpod/model-store/huggingface/{repo}/**/{basename}", recursive=True)
-    return hits[0] if hits else None
+    """Path to a RunPod-cached HF file on FAST storage, else None. RunPod surfaces the cache at two layouts seen in
+    the wild: the native run logs used /runpod/model-store/huggingface/<repo>/<rev>/snapshots/<rev>/<file>; the
+    current docs use the HF-hub form /runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<rev>/<file>
+    (same mount as the volume but fast-backed — 'loads significantly faster than a network volume'). Glob both by
+    basename so we resolve it wherever RunPod put it; a miss falls back to the volume (no speedup, still correct)."""
+    mangled = "models--" + repo.replace("/", "--")
+    for root in (f"/runpod/model-store/huggingface/{repo}",
+                 f"/runpod/model-store/huggingface/{mangled}",
+                 f"/runpod-volume/huggingface-cache/hub/{mangled}"):
+        hits = glob.glob(f"{root}/**/{basename}", recursive=True)
+        if hits:
+            return hits[0]
+    return None
 
 def _mirror_into(real_dir, vol_dir):
     """Make real_dir a real directory and symlink each entry of vol_dir into it, so all sibling models stay

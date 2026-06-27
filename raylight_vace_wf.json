@@ -4,20 +4,20 @@
     "inputs": {
       "ray_cluster_address": "local",
       "ray_cluster_namespace": "default",
-      "GPU": 1,
-      "ulysses_degree": 1,
+      "GPU": 2,
+      "ulysses_degree": 2,
       "ring_degree": 1,
       "cfg_degree": 1,
       "dp_degree": 1,
       "sync_ulysses": false,
-      "clear_vram_after_sampling": true,
-      "FSDP": false,
+      "clear_vram_after_sampling": false,
+      "FSDP": true,
       "FSDP_CPU_OFFLOAD": false,
       "XFuser_attention": "TORCH_FLASH",
       "skip_comm_test": false,
       "use_mmap": false
     },
-    "_meta": { "title": "RayInitializer" }
+    "_meta": { "title": "RayInitializer (FSDP 2-GPU)" }
   },
   "2": {
     "class_type": "RayLoraLoader",
@@ -28,15 +28,14 @@
     "_meta": { "title": "Ray LoRA (FusionX)" }
   },
   "3": {
-    "class_type": "RayGGUFLoader",
+    "class_type": "RayUNETLoader",
     "inputs": {
-      "unet_name": "gguf/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf",
-      "dequant_dtype": "default",
-      "patch_dtype": "default",
+      "unet_name": "wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1.safetensors",
+      "weight_dtype": "default",
       "ray_actors_init": ["1", 0],
       "lora": ["2", 0]
     },
-    "_meta": { "title": "Ray GGUF Loader (VACE Q4)" }
+    "_meta": { "title": "Ray UNet Loader (VACE fp8 safetensors)" }
   },
   "4": {
     "class_type": "RayModelSamplingSD3",
@@ -182,7 +181,7 @@
       "images": ["17", 0],
       "frame_rate": 24,
       "loop_count": 0,
-      "filename_prefix": "RAYLIGHT_VACE_TEST/ray",
+      "filename_prefix": "FSDP_VACE/fsdp_usp",
       "format": "video/h264-mp4",
       "pingpong": false,
       "save_output": true,

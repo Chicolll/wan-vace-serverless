@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RunPod Serverless handler — Raylight (ComfyUI + Wan2.1-VACE-14B Q4 GGUF + FusionX) USP render.
+"""RunPod Serverless handler — Raylight FSDP (2-GPU fp8 VACE + USP) render.
 
 NET-NEW path. Robust serverless design (2026-06-24, after a first deploy where workers exited unhealthy because
 module-load blocked on ComfyUI before runpod.serverless.start() registered):
@@ -181,7 +181,7 @@ def _ensure_comfy(timeout=900):
 def _debug_models():
     base = os.path.join(VOL, "runpod-slim", "ComfyUI", "models")
     want = {
-        "gguf":     os.path.join(base, "unet", "gguf", "wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf"),
+        "fp8":      os.path.join(base, "diffusion_models", "wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1.safetensors"),
         "lora":     os.path.join(base, "loras", "Wan2.1_T2V_14B_FusionX_LoRA.safetensors"),
         "clip":     os.path.join(base, "clip", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
         "clip_alt": os.path.join(base, "text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
@@ -241,6 +241,8 @@ def _build_wf(job, n):
     w, h = int(job.get("width", 720)), int(job.get("height", 1280))
     wf["1"]["inputs"]["GPU"] = n
     wf["1"]["inputs"]["ulysses_degree"] = n
+    wf["1"]["inputs"]["FSDP"] = True
+    wf["1"]["inputs"]["FSDP_CPU_OFFLOAD"] = False
     wf["1"]["inputs"]["clear_vram_after_sampling"] = False
     for node, key in (("9", "src_video"), ("10", "src_mask")):
         if job.get(key): wf[node]["inputs"]["video"] = os.path.basename(job[key])
@@ -353,10 +355,10 @@ VOL_MODELS = os.path.join(VOL, "runpod-slim", "ComfyUI", "models")
 MODELS_DIR = os.path.join(COMFY_DIR, "models")
 # (ComfyUI-relative path under models/, HF repo that RunPod caches it from). Repos verified from the download manifest.
 CACHED_MODELS = [
-    ("unet/gguf/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf", "mickmumpitz/VACE_Skyreels_V3_R2V_Merge-GGUF"),
-    ("loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors",                "DeepBeepMeep/Wan2.1"),
-    ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",         "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
-    ("vae/wan_2.1_vae.safetensors",                                  "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+    ("diffusion_models/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1.safetensors", "Inner-Reflections/VACE_Skyreels_V3_R2V_Merge"),
+    ("loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors",                      "DeepBeepMeep/Wan2.1"),
+    ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",               "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+    ("vae/wan_2.1_vae.safetensors",                                        "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
 ]
 
 def _hoststore(repo, basename):

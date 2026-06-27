@@ -24,7 +24,7 @@ RUN python3.11 /opt/patch_raylight_init.py
 
 # Torch 2.8 env recipe (proven via raylight_build_28.sh on pod).
 COPY raylight_full_install.sh /opt/raylight_full_install.sh
-RUN COMFY_DIR=/opt/ComfyUI bash /opt/raylight_full_install.sh; tail -n 60 /root/install.log || true
+RUN COMFY_DIR=/opt/ComfyUI bash /opt/raylight_full_install.sh && tail -n 60 /root/install.log
 
 # RunPod SDK.
 RUN python3.11 -m pip install runpod

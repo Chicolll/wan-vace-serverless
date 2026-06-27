@@ -31,9 +31,8 @@ echo "=== [5] PINS (override) ===" | tee -a "$LOG"
 $PIP "transformers==4.49.0" "diffusers==0.33.1" 2>&1 | tee -a "$LOG"
 $PIP "numpy<2" 2>&1 | tee -a "$LOG"
 
-echo "=== [6] torch 2.8 cu126 LAST (override — must come after ComfyUI reqs) ===" | tee -a "$LOG"
-$PIP --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126 2>&1 | tee -a "$LOG"
-$PIP --force-reinstall --no-deps "nvidia-nccl-cu12==2.28.9" 2>&1 | tee -a "$LOG"
+echo "=== [6] torch 2.8.0 cu126 LAST (pinned — must come after ComfyUI reqs) ===" | tee -a "$LOG"
+$PIP --force-reinstall "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu126 2>&1 | tee -a "$LOG"
 $PIP runpod 2>&1 | tee -a "$LOG"
 
 echo "=== [7] VERIFY ===" | tee -a "$LOG"

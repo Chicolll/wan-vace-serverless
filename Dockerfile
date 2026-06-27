@@ -26,9 +26,6 @@ RUN python3.11 /opt/patch_raylight_init.py
 COPY raylight_full_install.sh /opt/raylight_full_install.sh
 RUN COMFY_DIR=/opt/ComfyUI bash /opt/raylight_full_install.sh && tail -n 60 /root/install.log
 
-# RunPod SDK.
-RUN python3.11 -m pip install runpod
-
 # COPY modified Raylight FSDP files with pre-shard support.
 COPY model_patcher_remote.py /opt/ComfyUI/custom_nodes/raylight/model_patcher_remote.py
 COPY fsdp_utils_remote.py    /opt/ComfyUI/custom_nodes/raylight/fsdp_utils_remote.py

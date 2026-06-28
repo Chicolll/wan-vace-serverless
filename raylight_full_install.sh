@@ -19,7 +19,7 @@ echo "=== [2] ComfyUI core reqs ===" | tee -a "$LOG"
 $PIP -r "$C/requirements.txt" 2>&1 | tee -a "$LOG"
 
 echo "=== [3] node reqs ===" | tee -a "$LOG"
-for n in ComfyUI-GGUF ComfyUI-KJNodes ComfyUI-VideoHelperSuite; do
+for n in ComfyUI-GGUF ComfyUI-KJNodes ComfyUI-VideoHelperSuite RES4LYF; do
   R="$C/custom_nodes/$n/requirements.txt"
   if [ -f "$R" ]; then echo "-- $n" | tee -a "$LOG"; $PIP -r "$R" 2>&1 | tee -a "$LOG" || echo "WARN $n (non-fatal)" | tee -a "$LOG"; fi
 done

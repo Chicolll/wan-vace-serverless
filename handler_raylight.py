@@ -416,11 +416,59 @@ def _setup_models():
                     os.unlink(leaf)
                 os.symlink(hs, leaf)
             log(f"model {rel} <- {('HOST-NVMe ' + hs) if hs else 'volume (cache miss)'}")
+        # CLIPLoader searches clip/, but the model lives in text_encoders/ on the volume.
+        _cross_link_model("clip", "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                          os.path.join(MODELS_DIR, "text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"))
+        # VAELoader expects the file directly in vae/, but the volume may have it inside vae/pixel_space/.
+        _cross_link_model("vae", "wan_2.1_vae.safetensors",
+                          os.path.join(VOL_MODELS, "vae", "pixel_space", "wan_2.1_vae.safetensors"))
     except Exception as e:
         log("setup_models failed:", repr(e))
 
+
+def _cross_link_model(subdir, filename, source):
+    """Ensure a model file is discoverable under MODELS_DIR/subdir/ by symlinking from source if needed."""
+    target_dir = os.path.join(MODELS_DIR, subdir)
+    target = os.path.join(target_dir, filename)
+    if os.path.lexists(target) and os.path.exists(target):
+        log(f"cross_link {subdir}/{filename}: already exists")
+        return
+    if not os.path.exists(source):
+        for alt in glob.glob(os.path.join(MODELS_DIR, "**", filename), recursive=True):
+            if os.path.exists(alt):
+                source = alt; break
+        else:
+            log(f"cross_link {subdir}/{filename}: source NOT FOUND (tried {source})")
+            return
+    if os.path.islink(target_dir):
+        vol_target = os.path.join(VOL_MODELS, subdir)
+        os.unlink(target_dir)
+        _mirror_into(target_dir, vol_target)
+    os.makedirs(target_dir, exist_ok=True)
+    if os.path.lexists(target):
+        os.unlink(target)
+    os.symlink(source, target)
+    log(f"cross_link {subdir}/{filename} -> {source} (exists={os.path.exists(target)})")
+
+
 _setup_models()
-_bind("input",  INPUTS_DIR)
+# Log model dir contents for debug visibility
+for _sd in ("clip", "text_encoders", "vae", "diffusion_models", "loras"):
+    _p = os.path.join(MODELS_DIR, _sd)
+    try:
+        _ents = sorted(os.listdir(_p))[:10] if os.path.isdir(_p) else f"MISSING(link={os.path.islink(_p)})"
+        log(f"models/{_sd}: {_ents}")
+    except Exception as _e:
+        log(f"models/{_sd}: ERR {_e}")
+
+_bind("input", INPUTS_DIR)
+# Log input dir contents
+try:
+    _inp = os.path.join(COMFY_DIR, "input")
+    _ents = sorted(os.listdir(_inp))[:15] if os.path.isdir(_inp) else f"NOT_DIR(exists={os.path.exists(_inp)},link={os.path.islink(_inp)})"
+    log(f"input dir ({_inp} -> {os.path.realpath(_inp) if os.path.lexists(_inp) else 'N/A'}): {_ents}")
+except Exception as _e:
+    log(f"input dir: ERR {_e}")
 
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "

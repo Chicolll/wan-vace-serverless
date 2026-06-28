@@ -14,7 +14,8 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
  && git clone https://github.com/komikndr/raylight && (cd raylight && git checkout ec3ac78) \
  && git clone --depth 1 https://github.com/city96/ComfyUI-GGUF \
  && git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes \
- && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+ && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
+ && git clone --depth 1 https://github.com/ClownsharkBatwing/RES4LYF
 
 # Torchaudio ABI patch: wrap nodes_lt and comfyui_ltxv imports in Raylight __init__.py.
 # These nodes load torchaudio operators that ABI-mismatch with torch 2.8 on the base

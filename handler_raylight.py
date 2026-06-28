@@ -237,7 +237,7 @@ def _debug():
 
 def _build_wf(job, n):
     wf = json.load(open(WF_PATH))
-    length = int(job.get("frame_num", 81)); steps = int(job.get("sample_steps", 6))
+    length = int(job.get("frame_num", 81)); steps = int(job.get("sample_steps", 8))  # v3: res_2s wants ~8 steps
     w, h = int(job.get("width", 720)), int(job.get("height", 1280))
     wf["1"]["inputs"]["GPU"] = n
     wf["1"]["inputs"]["ulysses_degree"] = n
@@ -252,9 +252,14 @@ def _build_wf(job, n):
     for nd in ("13", "14"): wf[nd]["inputs"]["width"], wf[nd]["inputs"]["height"] = w, h
     wf["14"]["inputs"]["length"] = length
     wf["15"]["inputs"]["steps"] = steps
+    # v3: workflow JSON defaults to res_2s/beta57 (Anna's quality sampler). Allow a per-job
+    # override so euler can be A/B'd against res_2s WITHOUT rebuilding the image.
+    if job.get("sampler_name"): wf["15"]["inputs"]["sampler_name"] = job["sampler_name"]
+    if job.get("scheduler"):    wf["15"]["inputs"]["scheduler"] = job["scheduler"]
     if job.get("prompt"): wf["7"]["inputs"]["text"] = job["prompt"]
-    wf["18"]["inputs"]["filename_prefix"] = f"SLBENCH/{WORKER_ID}_{int(time.time())}"
-    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n}
+    wf["18"]["inputs"]["filename_prefix"] = f"V3/{WORKER_ID}_{int(time.time())}"
+    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n,
+                "sampler": wf["15"]["inputs"]["sampler_name"], "scheduler": wf["15"]["inputs"]["scheduler"]}
 
 
 def handler(event):

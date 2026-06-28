@@ -406,9 +406,8 @@ def _setup_models():
             for comp in parts[:-1]:
                 cur, volcur = os.path.join(cur, comp), os.path.join(volcur, comp)
                 if os.path.islink(cur):
-                    os.unlink(cur); _mirror_into(cur, volcur)
-                elif not os.path.isdir(cur):
-                    _mirror_into(cur, volcur)
+                    os.unlink(cur)
+                _mirror_into(cur, volcur)
             hs = _hoststore(repo, os.path.basename(rel))
             leaf = os.path.join(MODELS_DIR, *parts)
             if hs:
@@ -419,9 +418,7 @@ def _setup_models():
         # CLIPLoader searches clip/, but the model lives in text_encoders/ on the volume.
         _cross_link_model("clip", "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
                           os.path.join(MODELS_DIR, "text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"))
-        # VAELoader expects the file directly in vae/, but the volume may have it inside vae/pixel_space/.
-        _cross_link_model("vae", "wan_2.1_vae.safetensors",
-                          os.path.join(VOL_MODELS, "vae", "pixel_space", "wan_2.1_vae.safetensors"))
+        # VAE: _mirror_into already symlinks vae/wan_2.1_vae.safetensors from the volume
     except Exception as e:
         log("setup_models failed:", repr(e))
 

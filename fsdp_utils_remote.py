@@ -291,15 +291,13 @@ def fully_shard_bottom_up(
     for _name, module in shard_order:
         kwargs = dict(fsdp_kwargs)
         ignored_params: set[torch.nn.Parameter] = set()
-        if native_ignore_scale:
-            ignored_params |= collect_scale_ignored_params(module)
-
-        ignored_params |= collect_input_scale_ignored_params(module)
-        ignored_params |= collect_scalar_ignored_params(module)
-        ignored_params |= collect_odd_dim0_ignored_params(module)
-
-        subtree_params = set(module.parameters())
-        ignored_params |= (excluded_params & subtree_params)
+        for param_name, param in module.named_parameters(recurse=True):
+            if param in excluded_params or \
+               (native_ignore_scale and "scale" in param_name) or \
+               "input_scale" in param_name or \
+               param.ndim == 0 or \
+               (param.ndim > 0 and param.shape[0] % 2 == 1):
+                ignored_params.add(param)
 
         if ignored_params and _FSDP_HAS_IGNORED_PARAMS:
             kwargs["ignored_params"] = ignored_params

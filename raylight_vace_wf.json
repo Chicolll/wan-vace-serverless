@@ -151,7 +151,7 @@
       "add_noise": "enable",
       "noise_seed": 1234567,
       "steps": 5,
-      "cfg": 1.0,
+      "cfg": 6.0,
       "sampler_name": "res_2s",
       "scheduler": "beta57",
       "ray_actors": ["4", 0],

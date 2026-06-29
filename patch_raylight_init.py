@@ -38,4 +38,5 @@ for mod in MODULES:
 open(INIT, "w").write(src)
 print(f"Done: {patched}/{len(MODULES)} imports wrapped in {INIT}")
 if patched == 0:
-    print("Nothing to patch — modules not present in this Raylight version (safe to skip)")
+    print("No imports needed patching (upstream may have removed them) — OK")
+    sys.exit(0)

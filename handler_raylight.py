@@ -13,6 +13,17 @@ module-load blocked on ComfyUI before runpod.serverless.start() registered):
 """
 import os, sys, time, json, glob, base64, traceback, subprocess, threading, shutil, urllib.request, urllib.error
 
+# --- HOTPATCH: if a newer handler exists on the volume, re-exec from it. ---
+_HP = os.path.join(os.environ.get("VOL", "/runpod-volume"), "code_hotpatch", "handler_raylight_fsdp.py")
+if os.path.isfile(_HP) and os.path.abspath(_HP) != os.path.abspath(__file__):
+    try:
+        if os.path.getmtime(_HP) > os.path.getmtime(__file__):
+            shutil.copy2(_HP, __file__)
+            print(f"[hotpatch] replaced {__file__} from {_HP}, re-exec", flush=True)
+            os.execv(sys.executable, [sys.executable, "-u", __file__] + sys.argv[1:])
+    except Exception as e:
+        print(f"[hotpatch] failed (non-fatal): {e}", flush=True)
+
 
 def log(*a):
     try: print("[handler]", *a, flush=True)
@@ -256,9 +267,7 @@ def _build_wf(job, n):
     if job.get("scheduler"): wf["15"]["inputs"]["scheduler"] = job["scheduler"]
     if job.get("prompt"): wf["7"]["inputs"]["text"] = job["prompt"]
     wf["18"]["inputs"]["filename_prefix"] = f"SLBENCH/{WORKER_ID}_{int(time.time())}"
-    sampler = wf["15"]["inputs"]["sampler_name"]; sched = wf["15"]["inputs"]["scheduler"]
-    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n,
-                "sampler_name": sampler, "scheduler": sched}
+    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n}
 
 
 def handler(event):
@@ -357,24 +366,33 @@ def _bind(sub, target):
 # SAFE FALLBACK: no cache registered => _hoststore returns None for all => behaviour identical to the old volume bind.
 VOL_MODELS = os.path.join(VOL, "runpod-slim", "ComfyUI", "models")
 MODELS_DIR = os.path.join(COMFY_DIR, "models")
-# (ComfyUI-relative path under models/, HF repo that RunPod caches it from). Repos verified from the download manifest.
+# All production models consolidated in one HF repo for RunPod model caching.
+CACHE_REPO = "Chicolll/bg-replace-pipeline"
 CACHED_MODELS = [
-    ("diffusion_models/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1.safetensors", "Inner-Reflections/VACE_Skyreels_V3_R2V_Merge"),
-    ("loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors",                      "DeepBeepMeep/Wan2.1"),
-    ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",               "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
-    ("vae/wan_2.1_vae.safetensors",                                        "Comfy-Org/Wan_2.1_ComfyUI_repackaged"),
+    ("diffusion_models/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1.safetensors", CACHE_REPO),
+    ("loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors",                      CACHE_REPO),
+    ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",               CACHE_REPO),
+    ("vae/wan_2.1_vae.safetensors",                                        CACHE_REPO),
+    ("text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",                CACHE_REPO),
+    ("unet/qwen-image-edit-2511-Q5_0.gguf",                                CACHE_REPO),
+    ("loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors",  CACHE_REPO),
+    ("vae/qwen_image_vae.safetensors",                                     CACHE_REPO),
+    ("sam3/sam3.pt",                                                        CACHE_REPO),
 ]
 
-def _hoststore(repo, basename):
-    """Path to a RunPod-cached HF file on FAST storage, else None. RunPod surfaces the cache at two layouts seen in
-    the wild: the native run logs used /runpod/model-store/huggingface/<repo>/<rev>/snapshots/<rev>/<file>; the
-    current docs use the HF-hub form /runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<rev>/<file>
-    (same mount as the volume but fast-backed — 'loads significantly faster than a network volume'). Glob both by
-    basename so we resolve it wherever RunPod put it; a miss falls back to the volume (no speedup, still correct)."""
+def _hoststore(repo, rel_path):
+    """Path to a RunPod-cached HF file on FAST storage, else None."""
+    basename = os.path.basename(rel_path)
+    # Direct hit at the documented model-cache path (set via endpoint modelName field).
+    direct = f"/runpod/cache/{repo}/main/{rel_path}"
+    if os.path.isfile(direct):
+        return direct
+    # Fallback: glob older RunPod cache layouts by basename.
     mangled = "models--" + repo.replace("/", "--")
     for root in (f"/runpod/model-store/huggingface/{repo}",
                  f"/runpod/model-store/huggingface/{mangled}",
-                 f"/runpod-volume/huggingface-cache/hub/{mangled}"):
+                 f"/runpod-volume/huggingface-cache/hub/{mangled}",
+                 f"/runpod/cache/{repo}"):
         hits = glob.glob(f"{root}/**/{basename}", recursive=True)
         if hits:
             return hits[0]
@@ -410,66 +428,21 @@ def _setup_models():
             for comp in parts[:-1]:
                 cur, volcur = os.path.join(cur, comp), os.path.join(volcur, comp)
                 if os.path.islink(cur):
-                    os.unlink(cur)
-                _mirror_into(cur, volcur)
-            hs = _hoststore(repo, os.path.basename(rel))
+                    os.unlink(cur); _mirror_into(cur, volcur)
+                elif not os.path.isdir(cur):
+                    _mirror_into(cur, volcur)
+            hs = _hoststore(repo, rel)
             leaf = os.path.join(MODELS_DIR, *parts)
             if hs:
                 if os.path.lexists(leaf):
                     os.unlink(leaf)
                 os.symlink(hs, leaf)
             log(f"model {rel} <- {('HOST-NVMe ' + hs) if hs else 'volume (cache miss)'}")
-        # CLIPLoader searches clip/, but the model lives in text_encoders/ on the volume.
-        _cross_link_model("clip", "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-                          os.path.join(MODELS_DIR, "text_encoders", "umt5_xxl_fp8_e4m3fn_scaled.safetensors"))
-        # VAE: _mirror_into already symlinks vae/wan_2.1_vae.safetensors from the volume
     except Exception as e:
         log("setup_models failed:", repr(e))
 
-
-def _cross_link_model(subdir, filename, source):
-    """Ensure a model file is discoverable under MODELS_DIR/subdir/ by symlinking from source if needed."""
-    target_dir = os.path.join(MODELS_DIR, subdir)
-    target = os.path.join(target_dir, filename)
-    if os.path.lexists(target) and os.path.exists(target):
-        log(f"cross_link {subdir}/{filename}: already exists")
-        return
-    if not os.path.exists(source):
-        for alt in glob.glob(os.path.join(MODELS_DIR, "**", filename), recursive=True):
-            if os.path.exists(alt):
-                source = alt; break
-        else:
-            log(f"cross_link {subdir}/{filename}: source NOT FOUND (tried {source})")
-            return
-    if os.path.islink(target_dir):
-        vol_target = os.path.join(VOL_MODELS, subdir)
-        os.unlink(target_dir)
-        _mirror_into(target_dir, vol_target)
-    os.makedirs(target_dir, exist_ok=True)
-    if os.path.lexists(target):
-        os.unlink(target)
-    os.symlink(source, target)
-    log(f"cross_link {subdir}/{filename} -> {source} (exists={os.path.exists(target)})")
-
-
 _setup_models()
-# Log model dir contents for debug visibility
-for _sd in ("clip", "text_encoders", "vae", "diffusion_models", "loras"):
-    _p = os.path.join(MODELS_DIR, _sd)
-    try:
-        _ents = sorted(os.listdir(_p))[:10] if os.path.isdir(_p) else f"MISSING(link={os.path.islink(_p)})"
-        log(f"models/{_sd}: {_ents}")
-    except Exception as _e:
-        log(f"models/{_sd}: ERR {_e}")
-
-_bind("input", INPUTS_DIR)
-# Log input dir contents
-try:
-    _inp = os.path.join(COMFY_DIR, "input")
-    _ents = sorted(os.listdir(_inp))[:15] if os.path.isdir(_inp) else f"NOT_DIR(exists={os.path.exists(_inp)},link={os.path.islink(_inp)})"
-    log(f"input dir ({_inp} -> {os.path.realpath(_inp) if os.path.lexists(_inp) else 'N/A'}): {_ents}")
-except Exception as _e:
-    log(f"input dir: ERR {_e}")
+_bind("input",  INPUTS_DIR)
 
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "

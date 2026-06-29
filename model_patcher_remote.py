@@ -233,6 +233,7 @@ def _collect_controlnet_shared_modules(diffusion_model: torch.nn.Module) -> set[
 
 
 def patch_fsdp(self):
+    import sys as _sys; print(f">>> HOTPATCH_VERIFY rank={getattr(self,'rank','?')} file={__file__} <<<", flush=True)
     print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
     if isinstance(self.model.diffusion_model, FSDPModule):
@@ -272,8 +273,9 @@ def patch_fsdp(self):
     )
 
     import os, time as _time
-    _shard_dir = os.environ.get("FSDP_SHARD_DIR", "")
+    _shard_dir = os.environ.get("FSDP_SHARD_DIR", "") or "/runpod-volume/fsdp_shards"
     _shard_path = os.path.join(_shard_dir, f"rank_{self.rank}.pt") if _shard_dir else ""
+    print(f"[Rank {self.rank}] shard_dir={_shard_dir} shard_path={_shard_path} exists={os.path.isfile(_shard_path) if _shard_path else False}")
     _loaded_preshard = False
 
     if _shard_path and os.path.isfile(_shard_path):
@@ -294,7 +296,7 @@ def patch_fsdp(self):
                 device=target_device,
                 strict=False,
                 cpu_offload=self.is_cpu_offload,
-                release_sd=False,
+                release_sd=True,
             )
         else:
             options = StateDictOptions(

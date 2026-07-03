@@ -248,11 +248,14 @@ def _debug():
 
 def _build_wf(job, n):
     wf = json.load(open(WF_PATH))
-    length = int(job.get("frame_num", 81)); steps = int(job.get("sample_steps", 5))
-    w, h = int(job.get("width", 720)), int(job.get("height", 1280))
+    # Defaults = Anna's validated pipeline settings (PIPELINE_GUIDE_FOR_PARTNER.md, 2026-07-03):
+    # 576p-class render res (aspect MUST match source orientation), res_2s/beta57/8, cfg 1.0 (FusionX).
+    length = int(job.get("frame_num", 81)); steps = int(job.get("sample_steps", 8))
+    w, h = int(job.get("width", 1024)), int(job.get("height", 576))
     wf["1"]["inputs"]["GPU"] = n
     wf["1"]["inputs"]["ulysses_degree"] = n
-    wf["1"]["inputs"]["FSDP"] = True
+    # FSDP only on sm90 (H100-class): fp8 NCCL reductions hard-error on A100 ("FP8 reduction ... sm90").
+    wf["1"]["inputs"]["FSDP"] = bool(job.get("fsdp", True))
     wf["1"]["inputs"]["FSDP_CPU_OFFLOAD"] = False
     wf["1"]["inputs"]["clear_vram_after_sampling"] = False
     for node, key in (("9", "src_video"), ("10", "src_mask")):
@@ -263,11 +266,16 @@ def _build_wf(job, n):
     for nd in ("13", "14"): wf[nd]["inputs"]["width"], wf[nd]["inputs"]["height"] = w, h
     wf["14"]["inputs"]["length"] = length
     wf["15"]["inputs"]["steps"] = steps
+    wf["15"]["inputs"]["cfg"] = float(job.get("cfg", 1.0))
     if job.get("sampler_name"): wf["15"]["inputs"]["sampler_name"] = job["sampler_name"]
     if job.get("scheduler"): wf["15"]["inputs"]["scheduler"] = job["scheduler"]
     if job.get("prompt"): wf["7"]["inputs"]["text"] = job["prompt"]
+    # 2D/cartoon targets need the default negative REPLACED (it bans "cartoon, anime, ..." which
+    # fights flat styles; swap in "photorealistic, 3d render, ..." per the pipeline guide).
+    if job.get("negative_prompt") is not None: wf["8"]["inputs"]["text"] = job["negative_prompt"]
     wf["18"]["inputs"]["filename_prefix"] = f"SLBENCH/{WORKER_ID}_{int(time.time())}"
-    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n}
+    return wf, {"length": length, "steps": steps, "width": w, "height": h, "n_gpus": n,
+                "cfg": wf["15"]["inputs"]["cfg"], "fsdp": wf["1"]["inputs"]["FSDP"]}
 
 
 def handler(event):

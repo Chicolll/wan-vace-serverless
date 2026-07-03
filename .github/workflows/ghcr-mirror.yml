@@ -1,0 +1,26 @@
+# Mirror the production slim image to GHCR (PRIVATE package).
+# Why (measured 2026-07-03): first pull of registry.runpod.net images costs ~500s fixed per host;
+# GHCR private pull measured at 34s for 2GB. Serving the worker image from GHCR cuts fresh-host
+# cold start from ~10min to ~2min. User-directed.
+name: ghcr-mirror
+on:
+  push:
+    branches: [ghcr-mirror]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/chicolll/wan-vace-fsdp:slim-${{ github.sha }}

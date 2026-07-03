@@ -1,14 +1,26 @@
-# Serverless worker image — Raylight FSDP (2-GPU fp8 VACE + USP) render.
+# Serverless worker image — Raylight FSDP, SLIM build.
 #
-# Torch 2.8 (required for FSDP fp8 state-dict assertions), pre-shard support.
-# Models NOT baked (37GB image = can't place workers). They come from host NVMe
-# cache (RunPod model cache) or the network volume. Pre-sharded FSDP checkpoints
-# live on the volume (generated on first render, reused on subsequent cold starts).
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+# Same env as the 15 GB image (torch 2.8 cu126, pinned transformers/diffusers,
+# Raylight ec3ac78 + patches) minus the waste: the old image was built on the
+# CUDA -devel base with torch 2.4, then force-reinstalled torch 2.8 on top —
+# carrying two full PyTorch stacks and a CUDA toolkit nothing uses at runtime.
+# This one: minimal Python base, torch installed exactly once. The pip cu126
+# wheels bundle all CUDA runtime libraries; the GPU driver comes from the host.
+#
+# Measured motivation: cold-start probe 2026-07-03 — image pull + container
+# start is 585.5 s of the ~609 s delay (96%), at ~26 MB/s for 15 GB.
+FROM python:3.11-slim-bookworm
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 COMFY_DIR=/opt/ComfyUI
 WORKDIR /opt
 
-# ComfyUI + custom nodes (Raylight pinned to proven commit).
+# System deps: ffmpeg (VHS video encode), git (clone at build), libgl1+libglib2.0-0 (opencv
+# imports in node packs). python:3.11-slim puts python at /usr/local/bin; the install script
+# and the old image use /usr/bin/python3.11 — symlink so both paths work.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git ca-certificates libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -sf /usr/local/bin/python3.11 /usr/bin/python3.11
+
+# ComfyUI + custom nodes (Raylight pinned to proven commit) — same as the fat image.
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
  && cd /opt/ComfyUI/custom_nodes \
  && git clone https://github.com/komikndr/raylight && (cd raylight && git checkout ec3ac78) \
@@ -17,21 +29,21 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
  && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
  && git clone --depth 1 https://github.com/ClownsharkBatwing/RES4LYF
 
-# Torchaudio ABI patch: wrap nodes_lt and comfyui_ltxv imports in Raylight __init__.py.
-# These nodes load torchaudio operators that ABI-mismatch with torch 2.8 on the base
-# image (torch 2.4 torchaudio). They're LTX audio/video nodes, not needed for VACE.
+# Torchaudio ABI patch (LTX audio nodes not needed for VACE) — unchanged.
 COPY patch_raylight_init.py /opt/patch_raylight_init.py
 RUN python3.11 /opt/patch_raylight_init.py
 
-# Torch 2.8 env recipe (proven via raylight_build_28.sh on pod).
+# Python env — same recipe and ordering as raylight_full_install.sh (torch 2.8 LAST,
+# after ComfyUI reqs, so nothing downgrades it), but no prior torch to fight: the
+# --force-reinstall is unnecessary here and omitted so no duplicate stack exists.
 COPY raylight_full_install.sh /opt/raylight_full_install.sh
 RUN COMFY_DIR=/opt/ComfyUI bash /opt/raylight_full_install.sh && tail -n 60 /root/install.log
 
-# COPY modified Raylight FSDP files with pre-shard support.
+# Modified Raylight FSDP files with pre-shard support — unchanged.
 COPY model_patcher_remote.py /opt/ComfyUI/custom_nodes/raylight/model_patcher_remote.py
 COPY fsdp_utils_remote.py    /opt/ComfyUI/custom_nodes/raylight/fsdp_utils_remote.py
 
-# Hard build-time import gate.
+# Hard build-time import gate — unchanged.
 RUN python3.11 -c "\
 import torch, ray, diffusers, transformers, runpod; \
 from torch.distributed.fsdp import fully_shard; \
@@ -39,7 +51,7 @@ import inspect; assert 'ignored_params' in inspect.signature(fully_shard).parame
 print('IMG_ENV_OK torch', torch.__version__, 'diffusers', diffusers.__version__, \
       'transformers', transformers.__version__, 'FSDP2 ok')"
 
-# Handler + launcher + workflow + model-path map.
+# Handler + launcher + workflow + model-path map — unchanged.
 COPY handler_raylight.py    /opt/handler_raylight.py
 COPY comfy_launch.py        /opt/comfy_launch.py
 COPY pod_telemetry.sh       /opt/pod_telemetry.sh

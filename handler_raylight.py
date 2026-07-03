@@ -251,10 +251,11 @@ def _build_wf(job, n):
     # Defaults = Anna's validated pipeline settings (PIPELINE_GUIDE_FOR_PARTNER.md, 2026-07-03):
     # 576p-class render res (aspect MUST match source orientation), res_2s/beta57/8, cfg 1.0 (FusionX).
     length = int(job.get("frame_num", 81)); steps = int(job.get("sample_steps", 8))
-    w, h = int(job.get("width", 1024)), int(job.get("height", 576))
+    w, h = int(job.get("width", 576)), int(job.get("height", 1024))
     wf["1"]["inputs"]["GPU"] = n
     wf["1"]["inputs"]["ulysses_degree"] = n
-    # FSDP only on sm90 (H100-class): fp8 NCCL reductions hard-error on A100 ("FP8 reduction ... sm90").
+    # FSDP switchable per job. Anna's env errors FSDP+fp8 on A100 ("FP8 reduction ... sm90") but our
+    # stack verified it on 2xA100 SXM 6/27 — unresolved env difference, see PROJECT_HISTORY Phase 9.
     wf["1"]["inputs"]["FSDP"] = bool(job.get("fsdp", True))
     wf["1"]["inputs"]["FSDP_CPU_OFFLOAD"] = False
     wf["1"]["inputs"]["clear_vram_after_sampling"] = False

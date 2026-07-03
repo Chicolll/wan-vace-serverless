@@ -113,8 +113,8 @@
   "inputs": {
    "video": "mixkit_forest_walk_pre83_1280x720_driving.mp4",
    "force_rate": 24,
-   "custom_width": 1280,
-   "custom_height": 720,
+   "custom_width": 576,
+   "custom_height": 1024,
    "frame_load_cap": 81,
    "skip_first_frames": 0,
    "select_every_nth": 1,
@@ -129,8 +129,8 @@
   "inputs": {
    "video": "mixkit_forest_walk_pre83_1280x720_mask_inverted.mp4",
    "force_rate": 24,
-   "custom_width": 1280,
-   "custom_height": 720,
+   "custom_width": 576,
+   "custom_height": 1024,
    "frame_load_cap": 81,
    "skip_first_frames": 0,
    "select_every_nth": 1,
@@ -169,8 +169,8 @@
     "12",
     0
    ],
-   "width": 1280,
-   "height": 720,
+   "width": 576,
+   "height": 1024,
    "upscale_method": "lanczos",
    "keep_proportion": "pad_edge_pixel",
    "pad_color": "0, 0, 0",
@@ -197,8 +197,8 @@
     "6",
     0
    ],
-   "width": 1280,
-   "height": 720,
+   "width": 576,
+   "height": 1024,
    "length": 81,
    "batch_size": 1,
    "strength": 1.0,

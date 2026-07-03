@@ -5,7 +5,14 @@
 set -euo pipefail
 C="${COMFY_DIR:-/opt/ComfyUI}"
 PY="$(command -v python3.11 || command -v python3)"
-PIP="$PY -m pip install"
+# Constraints pin the base image's torch trio on EVERY pip call — first rebase build failed
+# exactly here: an unpinned dep upgraded torch to 2.12.1+cu130 past the base's 2.8.0.
+CONS=/opt/torch-constraints.txt
+printf 'torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+' > "$CONS"
+PIP="$PY -m pip install -c $CONS"
 LOG=/root/install.log
 : > "$LOG"
 echo "=== REBASE INSTALL START $(date -u) python=$PY ===" | tee -a "$LOG"

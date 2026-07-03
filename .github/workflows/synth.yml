@@ -1,0 +1,29 @@
+# Cold-start registry A/B: synthetic image (random bytes only, NO repo content).
+# User-authorized 2026-07-03 ("why are you waiting on me... permission to keep optimizing").
+# Tests whether GHCR-served images dodge the ~500s registry.runpod.net first-pull penalty.
+# Package + this branch are deleted after the test.
+name: coldstart-synth
+on:
+  push:
+    branches: [coldstart-synth]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: generate synthetic content (no checkout — repo content never touched)
+        run: |
+          mkdir ctx && cd ctx
+          head -c 2147483648 /dev/urandom > blob.bin
+          printf 'FROM alpine:3.20\nCOPY blob.bin /blob.bin\nCMD ["sleep","3600"]\n' > Dockerfile
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push
+        run: |
+          cd ctx
+          docker build -t ghcr.io/chicolll/coldstart-synth:probe .
+          docker push ghcr.io/chicolll/coldstart-synth:probe

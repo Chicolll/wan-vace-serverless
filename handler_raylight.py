@@ -454,10 +454,48 @@ def _setup_models():
 _setup_models()
 _bind("input",  INPUTS_DIR)
 
+def _boot_warmup():
+    """Init-preload (unbilled): after ComfyUI is up, run a tiny render so the 14B + FSDP shards +
+    CLIP + VAE are resident BEFORE the first billed request (clear_vram=False keeps them loaded).
+    First real render then starts warm-equivalent. BOOT_WARMUP=0 disables. Never raises."""
+    try:
+        if os.environ.get("BOOT_WARMUP", "1") != "1":
+            return
+        if not _ensure_comfy():
+            return
+        if max(_vram_used()) > 4000:   # FlashBoot revival with model already resident — skip
+            _beacon("warmup_skipped_resident"); return
+        job = {"prompt": "warmup: empty beach, no people",
+               "src_video": "workflowtest_pre83_720x1280_driving.mp4",
+               "src_mask": "workflowtest_pre83_720x1280_mask_inverted.mp4",
+               "src_ref_images": "workflowtest_qwen_beach_realistic_startimage.png",
+               "width": 128, "height": 128, "frame_num": 9, "sample_steps": 1,
+               "sampler_name": "euler", "scheduler": "beta", "cfg": 1.0}
+        wf, meta = _build_wf(job, _n_gpus())
+        wf["18"]["inputs"]["filename_prefix"] = f"WARMUP/{WORKER_ID}"
+        t0 = time.time()
+        _beacon("warmup_start", **{k: meta[k] for k in ("length", "steps", "width", "height")})
+        _hwtele("phase", "warmup_start")
+        body = json.dumps({"prompt": wf, "client_id": f"warmup_{WORKER_ID}"}).encode()
+        req = urllib.request.Request(URL + "/prompt", data=body, headers={"Content-Type": "application/json"})
+        pid = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())["prompt_id"]
+        while time.time() - t0 < 900:
+            time.sleep(5)
+            try: h = _get(f"/history/{pid}")
+            except Exception: continue
+            if pid in h:
+                ok = h[pid].get("status", {}).get("status_str") == "success"
+                _beacon("warmup_done", ok=ok, dur_s=round(time.time() - t0, 1), vram=_vram_used())
+                _hwtele("phase", f"warmup_done:ok={ok}")
+                return
+        _beacon("warmup_timeout", dur_s=round(time.time() - t0, 1))
+    except Exception as e:
+        _beacon("warmup_error", err=str(e)[:200])
+
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "
     f"vol_exists={os.path.isdir(VOL)} comfy_dir_exists={os.path.isdir(COMFY_DIR)}")
 _beacon("boot", on_volume=VOL_WRITABLE, vol_exists=os.path.isdir(VOL))
 _hwtele("start")   # full hw telemetry running BEFORE ComfyUI launches → captures the cold load (read vs dequant)
-threading.Thread(target=_ensure_comfy, daemon=True).start()   # warm in background; NEVER blocks start()
+threading.Thread(target=_boot_warmup, daemon=True).start()   # ensures comfy + preloads model; NEVER blocks start()
 runpod.serverless.start({"handler": handler})

@@ -231,7 +231,8 @@ def _debug():
         "handler_arch": "persistent_server_lazy", "n_gpus": _n_gpus(), "vram_used_mib": _vram_used(),
         "telemetry_dir": WDIR, "telemetry_on_volume": VOL_WRITABLE,
         "comfy": dict(_comfy_state),
-        "env_runpod": {k: v for k, v in os.environ.items() if k.startswith(("RUNPOD_", "MODEL_"))},
+        "env_runpod": {k: ("<redacted>" if any(s in k.upper() for s in ("KEY", "SECRET", "TOKEN", "PASSWORD")) else v)
+                       for k, v in os.environ.items() if k.startswith(("RUNPOD_", "MODEL_"))},
         "paths": {"VOL": VOL, "vol_exists": os.path.isdir(VOL),
                   "comfy_dir": COMFY_DIR, "comfy_dir_exists": os.path.isdir(COMFY_DIR),
                   "inputs_dir": INPUTS_DIR, "inputs_dir_exists": os.path.isdir(INPUTS_DIR),

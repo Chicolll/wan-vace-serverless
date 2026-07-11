@@ -723,8 +723,86 @@ def _serialize_local(t):
 def _deserialize_local(entry, device):
     if entry['q']:
         cls = get_layout_class(entry['ln'])
-        return QuantizedTensor(entry['qd'].to(device), cls, entry['p'])
+        p = entry['p']
+        # Move Params tensor fields (scale, block_scale, ...) onto the device so nothing stays a CPU
+        # view onto the mmap (matches the full-scatter path; avoids a render-time page fault that on a
+        # network FUSE file could SIGBUS). Defensive: any issue -> pass Params through unchanged.
+        try:
+            import dataclasses as _dc
+            if _dc.is_dataclass(p):
+                _upd = {f.name: getattr(p, f.name).to(device)
+                        for f in _dc.fields(p)
+                        if torch.is_tensor(getattr(p, f.name, None))}
+                if _upd:
+                    p = _dc.replace(p, **_upd)
+        except Exception:
+            p = entry['p']
+        return QuantizedTensor(entry['qd'].to(device), cls, p)
     return entry['d'].to(device)
+
+
+def _verify_bytes(path, saved, rank, nthreads=8):
+    """CONTROL for the mmap load: re-read the SAME file the buffered way (_parallel_read) and
+    byte-compare a deterministic 16-key sample of loaded entries against the mmap-loaded ones.
+    Proves mmap-mapped bytes == buffered-read bytes (silent-corruption discriminator) + checks the
+    mmap data is finite. In-process, same boot, no extra GPU render. Non-fatal; returns PASS/FAIL bool."""
+    try:
+        _bio2 = _parallel_read(path, nthreads)
+        saved2 = torch.load(_bio2, map_location='cpu', weights_only=False)
+        _bio2 = None
+    except Exception as _e:
+        print(f"[Rank {rank}] PRESHARD_VERIFY skipped (control load failed: {_e})", flush=True)
+        return True
+
+    def _eq(a, b):
+        try:
+            if not (torch.is_tensor(a) and torch.is_tensor(b)):
+                return a == b
+            if a.shape != b.shape or a.dtype != b.dtype:
+                return False
+            return bool(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)))
+        except Exception:
+            try:
+                return bool(torch.equal(a.float(), b.float()))
+            except Exception:
+                return False
+
+    keys = sorted(k for k in saved.keys() if k != '__meta__')
+    step = max(1, len(keys) // 16)
+    sample = keys[::step] if keys else []
+    n = qd_ok = sc_ok = fin_ok = 0
+    bad = []
+    for k in sample:
+        e1 = saved.get(k); e2 = saved2.get(k)
+        if e1 is None or e2 is None:
+            continue
+        n += 1
+        a = e1.get('qd', e1.get('d')); b = e2.get('qd', e2.get('d'))
+        if _eq(a, b):
+            qd_ok += 1
+        else:
+            bad.append(k)
+        try:
+            fin_ok += 1 if bool(torch.isfinite(a.float()).all()) else 0
+        except Exception:
+            fin_ok += 1
+        s1 = getattr(e1.get('p'), 'scale', None); s2 = getattr(e2.get('p'), 'scale', None)
+        if torch.is_tensor(s1) and torch.is_tensor(s2):
+            sc_ok += 1 if _eq(s1, s2) else 0
+        else:
+            sc_ok += 1
+    saved2 = None
+    ok = (n > 0 and qd_ok == n and fin_ok == n and sc_ok == n)
+    line = (f"[Rank {rank}] PRESHARD_VERIFY sample={n} qd_match={qd_ok}/{n} scale_match={sc_ok}/{n} "
+            f"finite={fin_ok}/{n} -> {'PASS' if ok else 'FAIL'}"
+            + (f" MISMATCH={bad[:5]}" if bad else ""))
+    print(line, flush=True)
+    try:
+        with open("/runpod-volume/preshard_load_log.txt", "a") as _lf:
+            _lf.write(line + "\n")
+    except Exception:
+        pass
+    return ok
 
 
 def preshard_version(full_sd, world_size):
@@ -797,32 +875,51 @@ def _parallel_read(path, nthreads=8):
     so parallel reads are ~2.4x+ faster than single-stream (measured 319→777 MB/s @4 streams).
     Returns a BytesIO for torch.load. Needs ~filesize RAM (box has 500GB)."""
     import io as _io, threading as _th
+    global _LAST_READ_TIMES, _LAST_READ_STEPS
     sz = _ps_os.path.getsize(path)
-    buf = bytearray(sz)
+    _ta = _ps_time.time()
+    buf = bytearray(sz)                    # STEP 1: allocate + zero-fill an 8GB buffer
+    _t_alloc = _ps_time.time() - _ta
     n = max(1, nthreads)
     chunk = (sz + n - 1) // n
+    _LAST_READ_TIMES = [None] * n          # per-thread [elapsed_s, MBps] -> is one thread a straggler?
 
     def _rd(i):
         off = i * chunk
         end = min(off + chunk, sz)
         if off >= end:
             return
+        _s = _ps_time.time(); _n = 0
+        _start_off = _s - _tr              # when this thread ACTUALLY began, vs spawn -> exposes GIL stagger
+        _t_open0 = _ps_time.time()
         mv = memoryview(buf)[off:end]
-        with open(path, 'rb', buffering=0) as f:
-            f.seek(off)
-            got = 0
-            while got < (end - off):
-                r = f.readinto(mv[got:])
-                if not r:
-                    break
-                got += r
+        f = open(path, 'rb', buffering=0); f.seek(off)
+        _t_open = _ps_time.time() - _t_open0
+        _t_io0 = _ps_time.time(); got = 0
+        while got < (end - off):
+            r = f.readinto(mv[got:])
+            if not r:
+                break
+            got += r; _n += r
+        _t_io = _ps_time.time() - _t_io0
+        f.close()
+        _dt = _ps_time.time() - _s
+        _LAST_READ_TIMES[i] = {"start_off": round(_start_off, 2), "open_seek": round(_t_open, 3),
+                               "readinto": round(_t_io, 2), "total": round(_dt, 2),
+                               "MBps": round(_n / 2**20 / _t_io) if _t_io else 0}
 
+    _tr = _ps_time.time()
     ths = [_th.Thread(target=_rd, args=(i,)) for i in range(n)]
     for t in ths:
         t.start()
     for t in ths:
         t.join()
-    return _io.BytesIO(buf)
+    _t_readwall = _ps_time.time() - _tr    # STEP 2: wall time of the 8 read threads (start->join)
+    _tb = _ps_time.time()
+    out = _io.BytesIO(buf)                 # STEP 3: copy the whole 8GB buffer into a BytesIO
+    _LAST_READ_STEPS = {"alloc_s": round(_t_alloc, 2), "read_wall_s": round(_t_readwall, 2),
+                        "bytesio_copy_s": round(_ps_time.time() - _tb, 2)}
+    return out
 
 
 def load_fsdp_shards(diffusion_model, path, device):
@@ -833,19 +930,109 @@ def load_fsdp_shards(diffusion_model, path, device):
     rank = dist.get_rank() if dist.is_initialized() else 0
     ws = dist.get_world_size() if dist.is_initialized() else 1
 
-    # PHASE 1: PARALLEL read into RAM (MooseFS ~2.4x faster with N streams), then unpickle from buffer
+    # HOST-STORE REMAP (2026-07-10): HOSTSTORE_SHARDS_DIR is set by the handler only when RunPod
+    # staged the repo's fsdp_shards_pr/ onto host NVMe (12.4 GB/s measured vs ~0.4 GB/s volume).
+    # Load remaps to the staged copy when the exact <hash>/<rank file> exists there; saves and
+    # every miss keep the volume path untouched.
+    _hsd = _ps_os.environ.get("HOSTSTORE_SHARDS_DIR", "")
+    if _hsd:
+        _cand = _ps_os.path.join(_hsd, _ps_os.path.basename(_ps_os.path.dirname(path)),
+                                 _ps_os.path.basename(path))
+        if _ps_os.path.isfile(_cand):
+            print(f"[b2][rank{rank}] shard load remapped to host store: {_cand}", flush=True)
+            path = _cand
+        else:
+            print(f"[b2][rank{rank}] host store set but no staged copy of {_cand} — volume path kept", flush=True)
+
+    # PHASE 1: get the shard dict into memory.
+    #   mmap path (default): torch.load(path, mmap=True) maps the file so the OS serves bytes straight
+    #   from page cache into torch storages — NO intermediate Python buffer. Kills the old 8GB bytearray
+    #   zero-fill + 8GB BytesIO copy (measured ~10-14s of the 12-16s "parallel_read"); the byte movement
+    #   folds into the .to(device) copy in PHASE 2 instead. FSDP_SHARD_MMAP=0 reverts to the 8-stream
+    #   read (kept as an A/B lever + fallback for a genuinely COLD MooseFS read prewarm didn't cover).
     _nrd = int(_ps_os.environ.get("FSDP_SHARD_READ_THREADS", "8"))
-    _tr = _ps_time.time()
-    _bio = _parallel_read(path, _nrd)
-    _t_pread = _ps_time.time() - _tr
-    saved = torch.load(_bio, map_location='cpu', weights_only=False)
-    _t_read = _ps_time.time() - t0
-    _bio = None
+    # HYBRID (2026-07-09, same-host eviction A/B, worker wmi26ane9dsqmq): mmap wins CACHED by 22x
+    # (1.0s vs 22.5s) but loses COLD-over-network 1.3-5x (44-165s vs 33-43s: serial page faults pull
+    # as little as 50 MB/s from MooseFS where 8 explicit streams hold 191-253 MB/s; confirmed in prod
+    # same boot — rank0 mmap cold 38.9s vs rank1 warm 2.9s). FSDP_SHARD_MMAP: "1"=force mmap,
+    # "0"=force 8-stream, "auto" (default)=mincore residency picks — >=50% resident -> mmap.
+    def _resident_frac(_p):
+        # mirrors the handler's production-proven _mincore_pct: ACCESS_COPY gives a WRITABLE (COW)
+        # mapping — ctypes.from_buffer REQUIRES writable; a PROT_READ map raises TypeError (that bug
+        # shipped 7/09 as silent resident_frac=-1.0 on both ranks; caught same day by the log line).
+        _m = None
+        try:
+            import mmap as _mmod, ctypes as _ct
+            _sz = _ps_os.path.getsize(_p)
+            if not _sz: return 1.0
+            _fd = _ps_os.open(_p, _ps_os.O_RDONLY)
+            try:
+                _m = _mmod.mmap(_fd, _sz, access=_mmod.ACCESS_COPY)
+            finally:
+                _ps_os.close(_fd)
+            _pg = _ps_os.sysconf("SC_PAGE_SIZE")
+            _npages = (_sz + _pg - 1) // _pg
+            _vec = (_ct.c_ubyte * _npages)()
+            _libc = _ct.CDLL("libc.so.6", use_errno=True)
+            _buf = (_ct.c_char * _sz).from_buffer(_m)
+            _rc = _libc.mincore(_ct.c_void_p(_ct.addressof(_buf)), _ct.c_size_t(_sz), _vec)
+            _buf = None                                   # release ctypes export before mmap close
+            if _rc != 0: return -2.0                      # errno path, distinct from exception path
+            _step = max(1, (1024 * 1024) // _pg)          # sample one page per MiB
+            _idx = range(0, _npages, _step)
+            return sum(_vec[_i] & 1 for _i in _idx) / max(1, len(_idx))
+        except Exception:
+            return -1.0
+        finally:
+            try:
+                if _m is not None: _m.close()
+            except Exception: pass
+    _mode_env = _ps_os.environ.get("FSDP_SHARD_MMAP", "auto")
+    if _mode_env == "1":
+        _use_mmap, _resfrac = True, None
+    elif _mode_env == "0":
+        _use_mmap, _resfrac = False, None
+    else:
+        _resfrac = _resident_frac(path)
+        _use_mmap = _resfrac >= 0.5 or _resfrac < 0     # mincore failure -> mmap (the prior default)
+    print(f"[b2][rank{rank}] loader mode={'mmap' if _use_mmap else '8stream'} "
+          f"(env={_mode_env} resident_frac={None if _resfrac is None else round(_resfrac, 3)})", flush=True)
+    def _cached_gib():
+        try:
+            for _l in open("/proc/meminfo"):
+                if _l.startswith("Cached:"): return int(_l.split()[1]) / (1024 * 1024)
+        except Exception: pass
+        return 0.0
+    _c0 = _cached_gib()
+    _rt = None
+    if _use_mmap:
+        _tr = _ps_time.time()
+        saved = torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+        _t_pread = 0.0                                # no separate read phase — storages are lazy mmap views
+        _cdelta = _cached_gib() - _c0
+        _t_read = _ps_time.time() - t0
+        _stp = {"mode": "mmap", "torch_load_s": round(_ps_time.time() - _tr, 2)}
+    else:
+        _tr = _ps_time.time()
+        _bio = _parallel_read(path, _nrd)
+        _t_pread = _ps_time.time() - _tr
+        _cdelta = _cached_gib() - _c0   # +~filesize GiB => read was COLD (faulted in); ~0 => cached (WARM)
+        saved = torch.load(_bio, map_location='cpu', weights_only=False)
+        _t_read = _ps_time.time() - t0
+        _bio = None
+        try: _stp = _LAST_READ_STEPS
+        except Exception: _stp = None
+        try: _rt = _LAST_READ_TIMES
+        except Exception: _rt = None
     meta = saved.pop('__meta__')
     if meta['ws'] != ws:
         raise ValueError(f"Pre-shard world_size {meta['ws']} != current {ws}")
     if meta['r'] != rank:
         raise ValueError(f"Pre-shard rank {meta['r']} != current {rank}")
+
+    if (_ps_os.environ.get("FSDP_SHARD_VERIFY", "0") == "1"
+            or _ps_os.path.exists("/runpod-volume/code_hotpatch/.fsdp_verify")):
+        _verify_bytes(path, saved, rank, _nrd)   # byte-identity control vs buffered read (no extra render)
 
     # PHASE 2: deserialize + CPU→GPU copy + DTensor reconstruct per param
     _t1 = _ps_time.time()
@@ -867,7 +1054,10 @@ def load_fsdp_shards(diffusion_model, path, device):
     _t2 = _ps_time.time()
     diffusion_model.load_state_dict(sharded_sd, strict=False, assign=True)
     _t_apply = _ps_time.time() - _t2
-    _bd = f"[Rank {rank}] PRESHARD_LOAD_BREAKDOWN parallel_read={_t_pread:.1f}s unpickle={_t_read-_t_pread:.1f}s recon+gpucopy={_t_recon:.1f}s apply={_t_apply:.1f}s total={_ps_time.time()-t0:.1f}s (threads={_nrd})"
+    _mode = "mmap" if _use_mmap else f"read{_nrd}"
+    _bd = (f"[Rank {rank}] PRESHARD_LOAD_BREAKDOWN mode={_mode} parallel_read={_t_pread:.1f}s cache_delta={_cdelta:.1f}GiB "
+           f"unpickle={_t_read-_t_pread:.1f}s recon+gpucopy={_t_recon:.1f}s apply={_t_apply:.1f}s "
+           f"total={_ps_time.time()-t0:.1f}s read_steps={_stp} read_threads[s,MBps]={_rt}")
     print(_bd, flush=True)
     try:  # reliable off-pod readback (stdout/comfy.log S3 view lag-truncates)
         with open("/runpod-volume/preshard_load_log.txt", "a") as _lf:
@@ -875,3 +1065,10 @@ def load_fsdp_shards(diffusion_model, path, device):
     except Exception:
         pass
     print(f"[Rank {rank}] Loaded {len(sharded_sd)} params from pre-shards ({_ps_time.time()-t0:.1f}s)", flush=True)
+    try:  # PREWARM MANIFEST: record the exact file this rank loaded so the next boot's shard
+          # prewarm warms the REAL bytes into host page cache (not stale versions). Fail-safe.
+        _mdir = _ps_os.path.dirname(_ps_os.path.dirname(path))  # = FSDP_SHARD_DIR
+        with open(_ps_os.path.join(_mdir, f".prewarm_manifest_rank{rank}"), "w") as _pf:
+            _pf.write(path)
+    except Exception:
+        pass

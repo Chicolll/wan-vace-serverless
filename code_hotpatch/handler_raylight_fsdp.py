@@ -156,12 +156,31 @@ def _ensure_comfy(timeout=900):
             env["COMFY_ARGS"] = cargs
             env["PYTHONUNBUFFERED"] = "1"
             logp = os.path.join(WDIR, "comfy.log")
-            try: out_f = open(logp, "ab", buffering=0)
+            # preserve the PREVIOUS boot's log before we overwrite it — a hard-killed container's
+            # final lines are the only crash-signature evidence (OOM cut-off vs driver trace).
+            try:
+                if os.path.exists(logp) and os.path.getsize(logp) > 0:
+                    shutil.copyfile(logp, os.path.join(WDIR, f"comfy_prev_{int(time.time())}.log"))
+            except Exception:
+                pass
+            try: out_f = open(logp, "wb", buffering=0)
             except Exception: out_f = None
             log(f"launching ComfyUI: COMFY_DIR={COMFY_DIR} args={cargs} gpus={env['CUDA_VISIBLE_DEVICES']}")
+            # PIPE stdout through a per-line EPOCH stamper -> every ComfyUI/Ray/NCCL/render-node line gets
+            # an absolute timestamp, so EVERY startup sub-phase + render node has a measurable duration
+            # (the log was previously un-timestamped -> those durations were dark).
             _comfy = subprocess.Popen([sys.executable, os.path.join(HERE, "comfy_launch.py")],
                                       env=env, cwd=COMFY_DIR,
-                                      stdout=(out_f or subprocess.DEVNULL), stderr=subprocess.STDOUT)
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            def _ts_pipe(src, dst):
+                try:
+                    for line in iter(src.readline, b""):
+                        try:
+                            (dst.write(f"{time.time():.3f} ".encode() + line) if dst else None)
+                            dst and dst.flush()
+                        except Exception: pass
+                except Exception: pass
+            threading.Thread(target=_ts_pipe, args=(_comfy.stdout, out_f), daemon=True).start()
             _comfy_state["pid"] = _comfy.pid
             _beacon("comfy_launch", pid=_comfy.pid)
         except Exception:
@@ -242,9 +261,200 @@ def _debug():
     except Exception as e: d["vol_listing"] = f"ERR {e}"
     d["models"] = _debug_models()
     d["comfy_dirs"] = _comfy_dirs()
+    d["shard_prewarm"] = dict(_shard_prewarm_state)
     if _comfy_state.get("phase") in ("error", "exception", "timeout"):
         d["comfy_log_tail"] = _tail(os.path.join(WDIR, "comfy.log"))
     return d
+
+
+def _io_probe():
+    """Pin EXACTLY why the cached shard read is ~700 MB/s (3x slower than a single quiet 2013 read).
+    Three controlled measurements on the SAME warm/cached file:
+      (1) THREAD SCALING 1->16: rate RISING with threads = per-read FUSE round-trip LATENCY bound
+          (parallelism hides it); rate FLAT = FUSE client BANDWIDTH capped.
+      (2) CONCURRENCY: read shard alone vs while a 2nd thread hammers the OTHER shard = does the
+          2-GPU/2-worker concurrency split the mfsmount throughput (the real loader case)?
+      (3) MOUNT OPTIONS: /proc/self/mountinfo for the volume = the FS + cache mode.
+    Pure I/O, no model load. Warms the file first so every timed read is from cache."""
+    import glob as _g
+    def _selfio():
+        d = {}
+        try:
+            for l in open("/proc/self/io"):
+                k, v = l.split(":"); d[k.strip()] = int(v)
+        except Exception: pass
+        return d
+    def _pread(path, nthreads, stop=None):
+        sz = os.path.getsize(path); buf = bytearray(sz); n = max(1, nthreads); chunk = (sz + n - 1)//n
+        def rd(i):
+            off = i*chunk; end = min(off+chunk, sz)
+            if off >= end: return
+            mv = memoryview(buf)[off:end]
+            with open(path, "rb", buffering=0) as f:
+                f.seek(off); got = 0
+                while got < end-off:
+                    if stop is not None and stop.is_set(): return
+                    r = f.readinto(mv[got:])
+                    if not r: break
+                    got += r
+        ts = [threading.Thread(target=rd, args=(i,)) for i in range(n)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        return sz
+    def _timed(path, nt, stop=None):
+        io0 = _selfio(); t0 = time.time(); sz = _pread(path, nt, stop=stop); dt = time.time()-t0; io1 = _selfio()
+        return {"s": round(dt, 2), "MBps": round(sz/2**20/dt) if dt else 0,
+                "read_bytes_gib": round((io1.get("read_bytes",0)-io0.get("read_bytes",0))/2**30, 2)}
+    res = {"worker": WORKER_ID}
+    try:
+        res["mounts"] = [l for l in open("/proc/self/mountinfo").read().splitlines()
+                         if "runpod-volume" in l or "fuse" in l.lower() or "moose" in l.lower()][:4]
+    except Exception as e:
+        res["mount_err"] = repr(e)[:120]
+    shards = []
+    for mp in sorted(_g.glob(os.path.join(VOL, "fsdp_shards_pr", ".prewarm_manifest_rank*"))):
+        try:
+            p = open(mp).read().strip()
+            if os.path.isfile(p): shards.append(p)
+        except Exception: pass
+    if not shards: return {"err": "no manifest shard found", "mounts": res.get("mounts")}
+    shard = shards[0]; other = shards[1] if len(shards) > 1 else shards[0]
+    res["shard"] = shard; res["size_gib"] = round(os.path.getsize(shard)/2**30, 2)
+    try:
+        _pread(shard, 8)                                          # warm the file into cache first
+        res["THREAD_SCALING_cached"] = {}
+        for nt in (1, 2, 4, 8, 16, 32):
+            res["THREAD_SCALING_cached"][f"{nt}t"] = _timed(shard, nt)   # rate vs thread count (cached)
+        res["CONCURRENCY_solo_8t"] = _timed(shard, 8)            # shard alone, 8 threads
+        st = threading.Event()
+        def _bg():
+            while not st.is_set(): _pread(other, 8, stop=st)     # 2nd reader on the OTHER shard = 2-GPU case
+        th = threading.Thread(target=_bg); th.start(); time.sleep(0.3)
+        res["CONCURRENCY_with_2nd_reader_8t"] = _timed(shard, 8)
+        st.set(); th.join(timeout=15)
+        smalls = []
+        for rel in ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae/wan_2.1_vae.safetensors",
+                    "loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors"):
+            p = os.path.realpath(os.path.join(VOL_MODELS, rel))
+            if os.path.isfile(p): smalls.append(p)
+        hammer_files = [other] + smalls
+        st2 = threading.Event()
+        def _hammer():
+            while not st2.is_set():
+                for hf in hammer_files:
+                    if st2.is_set(): break
+                    _pread(hf, 4, stop=st2)
+        hts = [threading.Thread(target=_hammer) for _ in range(6)]
+        for t in hts: t.start()
+        time.sleep(0.5)
+        res["SATURATED_read_8t"] = _timed(shard, 8)      # many concurrent mfs readers = full boot I/O
+        st2.set()
+        for t in hts: t.join(timeout=10)
+    except Exception as e:
+        res["probe_err"] = repr(e)[:200]
+    return res
+
+
+def _shard_ab(job):
+    """COLD-read A/B on the SAME host: mmap loader (FSDP_SHARD_MMAP=1 path) vs legacy 8-stream
+    reader, with page-cache EVICTION between reads (posix_fadvise DONTNEED) so every timed read
+    re-fetches from the backing volume. Validity is measured, not assumed: /proc/self/io read_bytes
+    must cover ~the file size (cold_valid) — a host/user-space cache that survives eviction shows
+    up as backing_read_gib≈0 + cache-class rate and voids that arm. Waits for the boot warmup to
+    finish first so reads run on a quiet worker. Rank shards discovered via the prewarm manifests
+    (same as _io_probe). rep0 runs both rank shards, later reps shard[0] only (cost control)."""
+    import glob as _g, io as _io
+    import torch
+    reps = int(job.get("reps", 2)); nthreads = int(job.get("threads", 8))
+    res = {"worker": WORKER_ID, "arms": []}
+    if job.get("wait_ready", 1):
+        t0 = time.time()
+        while time.time() - t0 < 420:            # warmup on a cold machine finishes ~+120s
+            if max(_vram_used()) > 8000: break
+            time.sleep(5)
+        res["waited_ready_s"] = round(time.time() - t0, 1)
+        time.sleep(3)
+    shards = []
+    for mp in sorted(_g.glob(os.path.join(VOL, "fsdp_shards_pr", ".prewarm_manifest_rank*"))):
+        try:
+            p = open(mp).read().strip()
+            if os.path.isfile(p): shards.append(p)
+        except Exception: pass
+    if not shards: return {"err": "no manifest shards", "worker": WORKER_ID}
+    def _evict(path):
+        with open(path, "rb") as f:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    def _selfio2():
+        d = {}
+        try:
+            for l in open("/proc/self/io"):
+                k, v = l.split(":"); d[k.strip()] = int(v)
+        except Exception: pass
+        return d
+    def _touch_pages(obj):
+        """Force page-in of every tensor, dtype-proof: view the UNTYPED storage as uint8 and read
+        one byte per 4KiB page (what .to(device) would fault in, without the copy)."""
+        seen, total = set(), 0
+        stack = [obj]
+        while stack:
+            x = stack.pop()
+            if torch.is_tensor(x):
+                s = x.untyped_storage()
+                if s.data_ptr() in seen: continue
+                seen.add(s.data_ptr())
+                u8 = torch.empty(0, dtype=torch.uint8); u8.set_(s)
+                if u8.numel(): total += int(u8[::4096].sum().item())
+            elif isinstance(x, dict): stack.extend(x.values())
+            elif isinstance(x, (list, tuple)): stack.extend(x)
+            elif hasattr(x, "__dict__"): stack.extend(vars(x).values())
+        return total
+    def _arm_mmap(path):
+        t0 = time.time()
+        obj = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+        t_open = time.time() - t0
+        _touch_pages(obj)                        # the page-in IS the read on this arm
+        return {"t_open": round(t_open, 2)}
+    def _arm_8stream(path):
+        sz = os.path.getsize(path); buf = bytearray(sz); chunk = (sz + nthreads - 1)//nthreads
+        t0 = time.time()
+        def rd(i):
+            off = i*chunk; end = min(off+chunk, sz)
+            if off >= end: return
+            mv = memoryview(buf)[off:end]
+            with open(path, "rb", buffering=0) as f:
+                f.seek(off); got = 0
+                while got < end-off:
+                    r = f.readinto(mv[got:])
+                    if not r: break
+                    got += r
+        ts = [threading.Thread(target=rd, args=(i,)) for i in range(nthreads)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        t_read = time.time() - t0
+        torch.load(_io.BytesIO(buf), map_location="cpu", weights_only=False)   # legacy eager unpickle
+        del buf
+        return {"t_read": round(t_read, 2)}
+    try:
+        for rep in range(reps):
+            for arm_name, fn in (("mmap", _arm_mmap), ("8stream", _arm_8stream)):
+                for path in (shards if rep == 0 else shards[:1]):
+                    sz_gib = os.path.getsize(path)/2**30
+                    _evict(path)
+                    io0 = _selfio2(); t0 = time.time()
+                    r = fn(path)
+                    dt = time.time() - t0; io1 = _selfio2()
+                    rb = (io1.get("read_bytes", 0) - io0.get("read_bytes", 0))/2**30
+                    res["arms"].append({"rep": rep, "arm": arm_name, "shard": os.path.basename(path)[-24:],
+                                        "size_gib": round(sz_gib, 2), "t_total_s": round(dt, 2),
+                                        "rate_MBps": round(sz_gib*1024/dt) if dt else 0,
+                                        "backing_read_gib": round(rb, 2), "cold_valid": rb > 0.8*sz_gib, **r})
+        for arm_name, fn in (("mmap_WARM", _arm_mmap), ("8stream_WARM", _arm_8stream)):   # no-evict baselines
+            t0 = time.time(); fn(shards[0]); dt = time.time() - t0
+            res["arms"].append({"arm": arm_name, "shard": os.path.basename(shards[0])[-24:],
+                                "t_total_s": round(dt, 2),
+                                "rate_MBps": round(os.path.getsize(shards[0])/2**20/dt) if dt else 0})
+    except Exception as e:
+        res["ab_err"] = repr(e)[:300]
+        res["trace"] = traceback.format_exc()[-800:]
+    return res
 
 
 def _build_wf(job, n):
@@ -282,7 +492,29 @@ def _build_wf(job, n):
 
 def handler(event):
     job = (event or {}).get("input", {}) or {}
+    if job.get("env_probe"):
+        # cheap pre-flight: run proc_sampler in preflight mode -> returns EXACTLY what is readable on
+        # this pod (cgroup version, ptrace/kmsg/fuse/perf caps, real sched keys, netns visibility) so
+        # we verify the one-shot capture will have data BEFORE spending it. No model load needed.
+        try:
+            d = os.path.join(WDIR, "pf")
+            subprocess.run([sys.executable, os.path.join(HERE, "proc_sampler.py"), d, "preflight"], timeout=90)
+            return json.loads(open(os.path.join(d, "boot.json")).read()).get("PREFLIGHT", {"err": "no PREFLIGHT"})
+        except Exception as e:
+            return {"env_probe_err": repr(e)[:300]}
+    if job.get("io_probe"):
+        return _io_probe()
+    if job.get("shard_ab") is not None:
+        return _shard_ab(job["shard_ab"] if isinstance(job["shard_ab"], dict) else {})
     if job.get("debug"):
+        # hold_sec: keep this job EXECUTING for N seconds (capped 120) — instrument for testing
+        # whether billed execution time resets RunPod's idle-container kill timer.
+        try:
+            hold = min(float(job.get("hold_sec") or 0), 120.0)
+        except Exception:
+            hold = 0.0
+        if hold > 0:
+            time.sleep(hold)
         return _debug()
     if not job.get("prompt"):
         return {"error": "prompt is required"}
@@ -324,9 +556,20 @@ def handler(event):
         if err: out["error"] = "render failed"; out["detail"] = err
         elif mp4s:
             data = open(mp4s[-1], "rb").read(); out["bytes"] = len(data)
-            out["video_base64"] = base64.b64encode(data).decode()
-        else:
-            out["error"] = "no output produced"
+            # RunPod response payloads have hard size limits; base64 adds +33%. Real-length clips
+            # (112-360 f => ~8-30 MB) must go via the volume instead of inline. Threshold in MB,
+            # override with VIDEO_INLINE_MAX_MB.
+            inline_max = float(os.environ.get("VIDEO_INLINE_MAX_MB", "6")) * 1024 * 1024
+            if len(data) <= inline_max:
+                out["video_base64"] = base64.b64encode(data).decode()
+            else:
+                rel = f"outputs/{WORKER_ID}_{jid}.mp4"
+                vol_path = os.path.join(VOL, rel)
+                os.makedirs(os.path.dirname(vol_path), exist_ok=True)
+                with open(vol_path, "wb") as f:
+                    f.write(data)
+                out["video_volume_path"] = rel   # fetch via S3 GET on the volume bucket
+                out["video_inline"] = False
         _beacon("req_exit", job_id=jid, total_s=out["total_s"], ok=("error" not in out), vram_exit=vram_exit)
         _hwtele("phase", f"req_exit:{jid}:ok={'error' not in out}")
         _hwtele("save")
@@ -420,6 +663,52 @@ def _mirror_into(real_dir, vol_dir):
 
 def _setup_models():
     """Per-file source selection for /opt/ComfyUI/models: volume by default; the 4 workflow models prefer host NVMe."""
+    # hoststore probe (2026-07-09): every cold boot logs "cache miss" — but WHY is invisible: does
+    # the host store not exist on our hosts, exist-but-empty, or exist with an unexpected layout?
+    # One boot with this logging answers it. Free passenger on every boot.
+    try:
+        _hs_seen = {}
+        for _hsroot in ("/runpod", "/runpod/model-store", "/runpod/model-store/huggingface", "/runpod/cache"):
+            if os.path.isdir(_hsroot):
+                _hs_seen[_hsroot] = sorted(os.listdir(_hsroot))[:12]
+                log(f"hoststore: {_hsroot} -> {_hs_seen[_hsroot]}")
+            else:
+                _hs_seen[_hsroot] = None
+                log(f"hoststore: {_hsroot} MISSING")
+        # stdout is console-only; mirror to the volume so the verdict survives without the console
+        _beacon("hoststore_probe", roots=_hs_seen)
+        # staged-store SPEED probe (test endpoint only — never in prod's boot path): evict, then
+        # 8-thread read of the first 2 GiB of the staged UNet. Runs before the prewarm thread
+        # spawns, so the measurement is clean. NVMe-class vs network-class is the go/no-go for
+        # wiring the load path onto the host store.
+        if os.environ.get("RUNPOD_ENDPOINT_ID") == "69qtffutk83l3o":
+            _p = ("/runpod/model-store/huggingface/Chicolll/bg-replace-pipeline/"
+                  "876036aae292599e10e514bfb1f6c99088a86497/snapshots/"
+                  "876036aae292599e10e514bfb1f6c99088a86497/diffusion_models/"
+                  "wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1.safetensors")
+            if os.path.isfile(_p):
+                import concurrent.futures as _cf
+                _fd = os.open(_p, os.O_RDONLY)
+                try: os.posix_fadvise(_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally: os.close(_fd)
+                _N, _CH = 8, 2 * 1024**3
+                def _rd(i):
+                    with open(_p, "rb", buffering=0) as f:
+                        f.seek(i * (_CH // _N)); n = 0
+                        while n < _CH // _N:
+                            b = f.read(min(16 * 1024**2, _CH // _N - n))
+                            if not b: break
+                            n += len(b)
+                    return n
+                _t0 = time.time()
+                with _cf.ThreadPoolExecutor(_N) as _ex:
+                    _tot = sum(_ex.map(_rd, range(_N)))
+                _dt = max(time.time() - _t0, 1e-6)
+                _beacon("hoststore_read_rate", gib=round(_tot / 1024**3, 2), sec=round(_dt, 2),
+                        gbps=round(_tot / 1024**3 / _dt, 2))
+    except Exception as _e:
+        log("hoststore probe failed:", repr(_e))
+    _src = {}
     try:
         os.makedirs(MODELS_DIR, exist_ok=True)
         # default: wholesale-symlink every volume model subdir (full discovery, volume reads — old behaviour)
@@ -447,7 +736,21 @@ def _setup_models():
                 if os.path.lexists(leaf):
                     os.unlink(leaf)
                 os.symlink(hs, leaf)
-            log(f"model {rel} <- {('HOST-NVMe ' + hs) if hs else 'volume (cache miss)'}")
+            _src[rel] = ("HOST-NVMe " + hs) if hs else "volume"
+            log(f"model {rel} <- {_src[rel] if hs else 'volume (cache miss)'}")
+        _beacon("model_sources", sources=_src)
+        # staged preshards (2026-07-10): if the repo carries fsdp_shards_pr/ and RunPod staged it,
+        # point the b2 loader at the host copy (12.4 GB/s measured vs ~0.4 GB/s volume). Loads only;
+        # saves still target the volume. Env inherits handler -> comfy -> ray workers (the same
+        # chain FSDP_SHARD_DIR already rides). Unset = loader behaviour unchanged.
+        try:
+            _sh = glob.glob(f"/runpod/model-store/huggingface/{CACHE_REPO}/*/snapshots/*/fsdp_shards_pr")
+            if _sh:
+                os.environ["HOSTSTORE_SHARDS_DIR"] = _sh[0]
+                log("staged preshards -> HOSTSTORE_SHARDS_DIR =", _sh[0])
+                _beacon("hoststore_shards", dir=_sh[0], entries=sorted(os.listdir(_sh[0])))
+        except Exception as _e:
+            log("staged-preshards probe failed:", repr(_e))
     except Exception as e:
         log("setup_models failed:", repr(e))
 
@@ -496,10 +799,233 @@ def _boot_warmup():
     except Exception as e:
         _beacon("warmup_error", err=str(e)[:200])
 
+# --- teardown logger: stamp the exact moment RunPod kills this process (SIGTERM / atexit), so
+# the job-end -> teardown delay becomes measurable instead of gap-bounded. One JSON line appended
+# to the volume; wholly fail-safe — can never affect boot or serving.
+def _install_teardown_logger():
+    try:
+        import signal, atexit
+        _boot_t = time.time()
+        def _stamp(reason):
+            try:
+                with open(os.path.join(VOL, "teardown_log.txt"), "a") as f:
+                    f.write(json.dumps({"t": time.strftime("%Y-%m-%d %H:%M:%S"), "epoch": round(time.time(), 1),
+                                        "worker": WORKER_ID, "reason": reason,
+                                        "uptime_s": round(time.time() - _boot_t, 1)}) + "\n")
+            except Exception:
+                pass
+        atexit.register(lambda: _stamp("atexit"))
+        def _on_signal(signum, frame):
+            _stamp(f"signal_{signum}")
+            raise SystemExit(0)
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            try: signal.signal(_sig, _on_signal)
+            except Exception: pass
+    except Exception:
+        pass
+_install_teardown_logger()
+
+# --- raylight patch applier: if code_hotpatch ships raylight_nodes_r1.py, install it over
+# raylight's nodes.py BEFORE ComfyUI boots (same delivery channel as the b2 files, no template
+# change needed). Absent file = no-op; fail-safe. GATED on RAYLIGHT_PRESTART=1 (2026-07-09): with
+# the flag off the worker runs STOCK raylight — flag=0 is a true rollback, no wrapper riding along.
+try:
+    _rlp_src = os.path.join(VOL, "code_hotpatch", "raylight_nodes_r1.py")
+    _rlp_dst = os.path.join(COMFY_DIR, "custom_nodes", "raylight", "src", "raylight", "nodes.py")
+    if os.environ.get("RAYLIGHT_PRESTART", "0") == "1" \
+            and os.path.isfile(_rlp_src) and os.path.isdir(os.path.dirname(_rlp_dst)):
+        shutil.copyfile(_rlp_src, _rlp_dst)
+        log(f"raylight nodes patch applied from {_rlp_src}")
+except Exception as _e:
+    log(f"raylight nodes patch skipped: {_e!r}")
+
+# --- shard cache prewarm: pull the newest preshard files into the OS page cache during the
+# unbilled boot window, in parallel with ComfyUI boot + Ray init, so the loader's parallel_read
+# (~78 s in) hits RAM instead of the network volume. Read-only and wholly fail-safe; costs zero
+# billed time. SHARD_CACHE_PREWARM=0 disables.
+_shard_prewarm_state = {"status": "off"}
+def _shard_cache_prewarm():
+    try:
+        if os.environ.get("SHARD_CACHE_PREWARM", "1") != "1":
+            return
+        sdir = os.environ.get("FSDP_SHARD_DIR", os.path.join(VOL, "fsdp_shards_pr"))
+        # PREFERRED: the EXACT shard files the loader used last boot (it writes one manifest line
+        # per rank after a successful load). The config version hash is stable across boots, so
+        # last boot's files == this boot's files. This replaces the old newest-per-basename glob,
+        # which warmed 23 GB of STALE shard versions while the loader read the real ~16 GB cold
+        # off the network volume EVERY boot (the 7/08 dead-prewarm bug — parallel_read never <8.6s).
+        manifest = []
+        for mp in glob.glob(os.path.join(sdir, ".prewarm_manifest_rank*")):
+            try:
+                fp = open(mp).read().strip()
+                if fp and os.path.isfile(fp):
+                    manifest.append(fp)
+            except Exception:
+                pass
+        if manifest:
+            files = sorted(set(manifest))
+            _shard_prewarm_state["src"] = "manifest"
+        else:
+            # FALLBACK (first-ever boot, before any load has written a manifest): newest .pt per
+            # rank across version dirs. Imperfect (mtime can point at a stale version) but it
+            # self-heals — the first successful load writes the manifest for every boot after.
+            by_name = {}
+            for p in glob.glob(os.path.join(sdir, "*", "rank_*.pt")):
+                k = os.path.basename(p)
+                if k not in by_name or os.path.getmtime(p) > os.path.getmtime(by_name[k]):
+                    by_name[k] = p
+            files = sorted(by_name.values())
+            _shard_prewarm_state["src"] = "glob_fallback"
+        # also warm the small render models the workflow reads (their storage-server cache is
+        # the biggest pre-warm variance source: TE staging measured 2.5 s warm vs ~90 s cold).
+        for rel in ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                    "vae/wan_2.1_vae.safetensors",
+                    "loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors"):
+            p = os.path.realpath(os.path.join(VOL_MODELS, rel))
+            if os.path.isfile(p):
+                files.append(p)
+        if not files:
+            _shard_prewarm_state.update(status="no_files", dir=sdir); return
+        nthreads = int(os.environ.get("SHARD_CACHE_PREWARM_THREADS", "8"))
+        _shard_prewarm_state.update(status="running", files=len(files))
+        t0 = time.time(); total = 0
+        chunk = 64 * 1024 * 1024
+        jobs = []
+        for p in files:
+            sz = os.path.getsize(p); total += sz
+            for off in range(0, sz, chunk):
+                jobs.append((p, off, min(chunk, sz - off)))
+        def _rd(j):
+            p, off, ln = j
+            with open(p, "rb", buffering=0) as f:
+                f.seek(off)
+                left = ln
+                while left > 0:
+                    b = f.read(min(8 * 1024 * 1024, left))
+                    if not b: break
+                    left -= len(b)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=nthreads) as ex:
+            list(ex.map(_rd, jobs))
+        dur = round(time.time() - t0, 1)
+        _shard_prewarm_state.update(status="done", gb=round(total / 2**30, 2), dur_s=dur, threads=nthreads)
+        log(f"shard_prewarm done {total >> 20} MiB in {dur}s (threads={nthreads}, files={len(files)})")
+        _beacon("shard_prewarm", gb=round(total / 2**30, 2), dur_s=dur)
+    except Exception as e:
+        _shard_prewarm_state.update(status=f"error:{str(e)[:80]}")
+threading.Thread(target=_shard_cache_prewarm, daemon=True).start()
+
 # --- module load: register the worker HEALTHY first, then warm ComfyUI in the background ---
 log(f"boot worker={WORKER_ID} epoch={MODULE_EPOCH} tele={WDIR} on_volume={VOL_WRITABLE} "
     f"vol_exists={os.path.isdir(VOL)} comfy_dir_exists={os.path.isdir(COMFY_DIR)}")
 _beacon("boot", on_volume=VOL_WRITABLE, vol_exists=os.path.isdir(VOL))
+# --- pod_telemetry.sh updater: the baked image ships an older pod_telemetry.sh; copy the enhanced one
+# (PSI/vmstat/full-meminfo/allproc-io/loadavg streams) from code_hotpatch over HERE BEFORE telemetry
+# starts, so the extra streams actually run. Fail-safe (missing file = keep baked version).
+try:
+    _pt_src = os.path.join(VOL, "code_hotpatch", "pod_telemetry.sh")
+    _pt_dst = os.path.join(HERE, "pod_telemetry.sh")
+    if os.path.isfile(_pt_src):
+        shutil.copyfile(_pt_src, _pt_dst)
+        log("pod_telemetry.sh updated from code_hotpatch")
+except Exception as _e:
+    log("pod_telemetry.sh update skipped:", repr(_e))
+
+# --- cache-residency logger: DIRECT read of "is each shard cached RIGHT NOW" via mincore, every 1s
+# from boot -> residency.csv on the volume. We READ the timeline: prewarm caches rank_N (goes to
+# 100%), whether it STAYS or gets evicted, and its EXACT residency when the loader reads it. No
+# timing inference. Also logs whole-box Cached + MemAvailable (the shared-host memory-pressure signal).
+def _mincore_pct(path):
+    """% of file pages resident in page cache via mincore. Returns a float, or an ERROR TAG string
+    (never silent None) so a broken instrument is visible in the log, not invisible."""
+    import ctypes, mmap as _mm
+    mm = None
+    try:
+        sz = os.path.getsize(path)
+        if sz <= 0: return "sz0"
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            mm = _mm.mmap(fd, sz, access=_mm.ACCESS_COPY)   # COW -> writable mapping (from_buffer needs writable), file untouched
+        finally:
+            os.close(fd)
+        ps = os.sysconf("SC_PAGE_SIZE"); n = (sz + ps - 1) // ps
+        vec = (ctypes.c_ubyte * n)()
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        buf = (ctypes.c_char * sz).from_buffer(mm)
+        rc = libc.mincore(ctypes.c_void_p(ctypes.addressof(buf)), ctypes.c_size_t(sz), vec)
+        if rc != 0:
+            res = "mc_errno%d" % ctypes.get_errno()
+        else:
+            res = round(100.0 * bytes(vec).count(1) / n, 1)   # mincore sets bit0=resident; count(1) is C-fast
+        buf = None   # release the ctypes export before closing the mmap
+        return res
+    except Exception as e:
+        return "ex:" + type(e).__name__
+    finally:
+        try:
+            if mm is not None: mm.close()
+        except Exception:
+            pass
+def _residency_logger():
+    try:
+        files = []
+        for mp in sorted(glob.glob(os.path.join(VOL, "fsdp_shards_pr", ".prewarm_manifest_rank*"))):
+            try:
+                p = open(mp).read().strip()
+                if os.path.isfile(p): files.append(p)
+            except Exception: pass
+        for rel in ("text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "vae/wan_2.1_vae.safetensors",
+                    "loras/Wan2.1_T2V_14B_FusionX_LoRA.safetensors"):
+            p = os.path.realpath(os.path.join(VOL_MODELS, rel))
+            if os.path.isfile(p): files.append(p)
+        csv = os.path.join(WDIR, "residency.csv")
+        with open(csv, "w") as f:
+            f.write("ts,boot_s,cached_gib,memavail_gib," + ",".join(os.path.basename(x) for x in files) + "\n")
+        while True:
+            cg = ma = 0.0
+            try:
+                for l in open("/proc/meminfo"):
+                    if l.startswith("Cached:"): cg = int(l.split()[1])/(1024*1024)
+                    elif l.startswith("MemAvailable:"): ma = int(l.split()[1])/(1024*1024)
+            except Exception: pass
+            row = [f"{time.time():.3f}", f"{time.time()-_BOOT_T:.1f}", f"{cg:.1f}", f"{ma:.1f}"] + \
+                  [str(_mincore_pct(x)) for x in files]
+            with open(csv, "a") as f: f.write(",".join(row) + "\n")
+            time.sleep(1)
+    except Exception as e:
+        log("residency_logger failed:", repr(e))
+threading.Thread(target=_residency_logger, daemon=True).start()
+
+# --- COMPLETE per-process/thread sampler (proc_sampler.py from code_hotpatch): every kernel observable
+# for every thread of every process, from boot -> WDIR/full/. Niced SEPARATE process (no GIL contention
+# with the handler). This is the "reconstruct any process's full behaviour from the logs" capture.
+try:
+    _ps_src = os.path.join(VOL, "code_hotpatch", "proc_sampler.py")
+    _ps_dst = os.path.join(HERE, "proc_sampler.py")
+    if os.path.isfile(_ps_src):
+        shutil.copyfile(_ps_src, _ps_dst)
+        os.makedirs(os.path.join(WDIR, "full"), exist_ok=True)
+        subprocess.Popen(["nice", "-n", "19", sys.executable, _ps_dst, os.path.join(WDIR, "full"), "1"],
+                         stdout=subprocess.DEVNULL, stderr=open(os.path.join(WDIR, "proc_sampler.err"), "w"))
+        log("proc_sampler launched -> WDIR/full/")
+    else:
+        log("proc_sampler.py not on volume — skipped")
+except Exception as _e:
+    log("proc_sampler launch skipped:", repr(_e))
+
+# preserve the PREVIOUS boot's hw telemetry before 'start' truncates the streams — same rationale
+# as comfy_prev: a killed container's last-seconds hw signals (rate collapse vs OOM ramp vs GPU
+# stall) are the only crash-mechanism evidence. Prune to the 6 newest so the volume doesn't grow.
+try:
+    _hw_dir = os.path.join(WDIR, "hw")
+    if os.path.isdir(_hw_dir) and os.listdir(_hw_dir):
+        os.rename(_hw_dir, os.path.join(WDIR, f"hw_prev_{int(time.time())}"))
+    _prev = sorted(d for d in os.listdir(WDIR) if d.startswith("hw_prev_"))
+    for _d in _prev[:-6]:
+        shutil.rmtree(os.path.join(WDIR, _d), ignore_errors=True)
+except Exception as _e:
+    log("hw_prev preservation skipped:", repr(_e))
+
 _hwtele("start")   # full hw telemetry running BEFORE ComfyUI launches → captures the cold load (read vs dequant)
 threading.Thread(target=_boot_warmup, daemon=True).start()   # ensures comfy + preloads model; NEVER blocks start()
 runpod.serverless.start({"handler": handler})

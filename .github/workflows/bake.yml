@@ -1,0 +1,28 @@
+name: bake-image
+# Lever-3 image bake via Actions (fallback path when local Docker is unavailable).
+# Runs ONLY on the bake-image branch — fsdp/raylight are RunPod-watched, this is not.
+# Expects Dockerfile.bake at the repo root (copied from serverless/Dockerfile.bake).
+on:
+  push:
+    branches: [bake-image]
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.bake
+          push: true
+          tags: ghcr.io/chicolll/wan-vace-fsdp:slim-baked-b4cc985

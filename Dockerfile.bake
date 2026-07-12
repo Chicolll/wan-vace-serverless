@@ -1,0 +1,17 @@
+# Lever-3 image bake (2026-07-12): pre-generate the init work every boot currently repeats.
+# Measured targets from boot logs (comfy_ready ~10.5-11.8s):
+#   - custom-node bytecode recompile (~1.5-2.5s/boot: the container's writable layer is
+#     discarded on every restart, so /opt/ComfyUI __pycache__ never persists)
+#   - matplotlib fontManager scan ("generated new fontManager", ~0.2-0.9s)
+#   (Alembic DB migration measured 0.06s -> deliberately NOT baked; not worth coupling.)
+# GPU-free build. Derived layer only — base stays byte-identical underneath.
+FROM ghcr.io/chicolll/wan-vace-fsdp:slim-b4cc985b41ef9ca59398516503bed07404a9c111
+
+# Bytecode for the ComfyUI tree + custom nodes (dist-packages already compiled by pip).
+# -j0 = all cores; || true: a single unparsable stray file must not fail the bake.
+RUN python3.11 -m compileall -q -j0 /opt/ComfyUI || true
+
+# Font cache: matplotlib scans system fonts on first import per container. Generate it at
+# build; runtime HOME is /root (verified: image runs as root), so the cache lands where the
+# runtime import looks.
+RUN HOME=/root python3.11 -c "import matplotlib.font_manager as fm; fm.fontManager; print('fontManager cached:', len(fm.fontManager.ttflist), 'fonts')"

@@ -23,10 +23,29 @@ jobs:
         with:
           context: slim_rebuild
           push: true
+          # plain manifest, no OCI attestation index: RunPod's puller gets the simplest
+          # possible artifact, and the size gate below sees layers directly
+          provenance: false
           tags: |
             ghcr.io/chicolll/wan-vace-trueslim:${{ github.sha }}
             ghcr.io/chicolll/wan-vace-trueslim:latest
       - name: size gate (<= 8 GiB compressed)
+        # descends into an index if one is present (first run pushed an attestation index whose
+        # raw form has no layers -> the old gate passed vacuously on 0 bytes)
         run: |
-          docker buildx imagetools inspect --raw ghcr.io/chicolll/wan-vace-trueslim:${{ github.sha }} \
-          | python3 -c "import json,sys; m=json.load(sys.stdin); L=m.get('layers',[]); s=sum(l['size'] for l in L); print(f'{s/2**30:.2f} GiB compressed across {len(L)} layers'); sys.exit(0 if s <= 8*2**30 else 1)"
+          docker buildx imagetools inspect --raw ghcr.io/chicolll/wan-vace-trueslim:${{ github.sha }} > /tmp/m.json
+          python3 - <<'EOF'
+          import json, subprocess, sys
+          m = json.load(open("/tmp/m.json"))
+          if "manifests" in m:  # OCI index: resolve the amd64 image manifest
+              d = next(x["digest"] for x in m["manifests"]
+                       if x.get("platform", {}).get("architecture") == "amd64")
+              raw = subprocess.check_output(["docker", "buildx", "imagetools", "inspect", "--raw",
+                                             f"ghcr.io/chicolll/wan-vace-trueslim@{d}"])
+              m = json.loads(raw)
+          L = m["layers"]  # KeyError = gate failure, by design
+          assert L, "no layers resolved"
+          s = sum(l["size"] for l in L)
+          print(f"{s/2**30:.2f} GiB compressed across {len(L)} layers")
+          sys.exit(0 if s <= 8*2**30 else 1)
+          EOF

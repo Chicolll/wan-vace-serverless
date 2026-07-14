@@ -34,7 +34,11 @@ RUN git clone --depth 1 --branch v0.27.0 https://github.com/comfyanonymous/Comfy
 RUN pip install "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0" \
         --index-url https://download.pytorch.org/whl/cu128
 COPY requirements.lock /tmp/requirements.lock
-RUN pip install -r /tmp/requirements.lock
+# --no-deps: the lock IS the complete closure (live pip freeze). The live env is internally
+# inconsistent (kernels 0.16.0 declares huggingface-hub>=1.10.0 but live runs 0.36.2), so the
+# resolver refuses to reproduce it (first Actions build failed exactly there). The import gate
+# below is the real correctness check.
+RUN pip install --no-deps -r /tmp/requirements.lock
 
 # raylight init patch (same step the live image ran)
 COPY patch_raylight_init.py /opt/patch_raylight_init.py

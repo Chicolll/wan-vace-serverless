@@ -20,6 +20,7 @@ flat folder, collision-proof names are the CLIENT's job (bake the date into the
 tag, e.g. DRIVING-D2-0715-BAKED.mp4). See PREPROCESS_ENDPOINT_SPEC.md.
 """
 import json, os, shutil, subprocess, sys, time
+import urllib.error
 import urllib.request
 
 import runpod
@@ -48,7 +49,11 @@ def _http(path, payload=None, timeout=30):
     req = urllib.request.Request(URL + path,
         data=json.dumps(payload).encode() if payload is not None else None,
         headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:3000]
+        raise RuntimeError(f"ComfyUI {path} HTTP {e.code}: {body}")
 
 
 def ensure_comfy(deadline_s=240):
@@ -122,7 +127,10 @@ def handler(job):
         if pref is not None:
             node["inputs"]["filename_prefix"] = f"job_{int(t0)}/" + pref
 
-    pid = _http("/prompt", {"prompt": graph}).get("prompt_id")
+    try:
+        pid = _http("/prompt", {"prompt": graph}).get("prompt_id")
+    except RuntimeError as e:
+        return {"error": "graph rejected", "detail": str(e)[:3000], "log_tail": _tail(LOG)}
     if not pid:
         return {"error": "submit failed", "log_tail": _tail(LOG)}
     deadline = time.time() + int(j.get("timeout_s", 1500))

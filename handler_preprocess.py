@@ -63,13 +63,14 @@ def ensure_comfy(deadline_s=240):
         return
     os.makedirs(INPUTS_DIR, exist_ok=True)
     os.makedirs(STAGE_DIR, exist_ok=True)
-    env = dict(os.environ)
-    env["COMFY_DIR"] = COMFY_DIR
-    env["COMFY_ARGS"] = (f"--listen 127.0.0.1 --port {PORT} --disable-auto-launch "
-                         f"--input-directory {INPUTS_DIR} --output-directory {STAGE_DIR} "
-                         f"--extra-model-paths-config {EMP}")
-    _comfy = subprocess.Popen([sys.executable, "/opt/comfy_launch.py"],
-                              stdout=open(LOG, "w"), stderr=subprocess.STDOUT, env=env)
+    # launch main.py directly with real argv — the runpy/COMFY_ARGS trick silently
+    # fails on current ComfyUI (flags never applied -> empty model lists, 2026-07-15)
+    _comfy = subprocess.Popen(
+        [sys.executable, os.path.join(COMFY_DIR, "main.py"),
+         "--listen", "127.0.0.1", "--port", str(PORT), "--disable-auto-launch",
+         "--input-directory", INPUTS_DIR, "--output-directory", STAGE_DIR,
+         "--extra-model-paths-config", EMP],
+        cwd=COMFY_DIR, stdout=open(LOG, "w"), stderr=subprocess.STDOUT)
     t0 = time.time()
     while time.time() - t0 < deadline_s:
         if _comfy.poll() is not None:

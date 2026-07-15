@@ -10,6 +10,10 @@ Job input:
    "outputs": {"<needle>": "<final.mp4>"},  # substring -> exact final filename
    "timeout_s": 1500}                       # optional
   or {"debug": true}                        # env/dir sanity check, no GPU work
+  or {"fetch": {"url": "...", "dest": "ComfyUI/models/sam3/sam3.pt"}}
+                                            # download big files straight to the volume
+                                            # (local S3 uploads cap at ~100MB — stage
+                                            # large model weights through this op)
 
 Output files land in INPUTS_DIR (default /runpod-volume/native-xdit/inputs) —
 flat folder, collision-proof names are the CLIENT's job (bake the date into the
@@ -90,6 +94,20 @@ def handler(job):
                 "inputs_dir_exists": os.path.isdir(INPUTS_DIR),
                 "stage_dir": STAGE_DIR, "emp_exists": os.path.isfile(EMP),
                 "inputs_sample": sorted(os.listdir(INPUTS_DIR))[:20] if os.path.isdir(INPUTS_DIR) else []}
+    if j.get("fetch"):
+        url, dest = j["fetch"]["url"], j["fetch"]["dest"]
+        if ".." in dest or dest.startswith("/"):
+            return {"error": "dest must be a relative volume path"}
+        path = os.path.join(VOL, dest)
+        if os.path.exists(path) and not j["fetch"].get("overwrite"):
+            return {"fetched": dest, "bytes": os.path.getsize(path), "skipped": "already exists"}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        t0 = time.time()
+        tmp = path + ".part"
+        with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, length=1 << 20)
+        os.replace(tmp, path)
+        return {"fetched": dest, "bytes": os.path.getsize(path), "secs": round(time.time() - t0, 1)}
     graph, outputs = j.get("graph"), j.get("outputs") or {}
     if not graph or not outputs:
         return {"error": "need input.graph and input.outputs"}

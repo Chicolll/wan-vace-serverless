@@ -1,0 +1,17 @@
+# Preprocess endpoint model map — points ComfyUI at the network volume's OLD MMZ layout,
+# where all preprocess models already live (qwen GGUF/LoRA/CLIP/VAE, depth ckpt, sam3).
+# (The render endpoint uses runpod-slim/ComfyUI/models — different map, same volume.)
+volume:
+  base_path: /runpod-volume/ComfyUI/
+  is_default: true
+  checkpoints: models/checkpoints/
+  clip: models/clip/
+  text_encoders: models/text_encoders/
+  vae: models/vae/
+  loras: models/loras/
+  unet: models/unet/
+  diffusion_models: models/diffusion_models/
+  gguf: models/unet/gguf/
+  sam3: models/sam3/
+  controlnet_aux: models/controlnet_aux/
+  custom_nodes_models: models/

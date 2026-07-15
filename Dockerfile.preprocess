@@ -1,0 +1,43 @@
+# Serverless worker image — PREPROCESS endpoint ("prep kitchen", 2026-07-15).
+#
+# Runs Anna's unified preprocessing graph (SAM3 mask + baked/depth driving videos +
+# Qwen starter frames) on 1 GPU. Models NOT baked — they live on the network volume
+# (old MMZ layout: /runpod-volume/ComfyUI/models). Spec: aivfx-pipeline/PREPROCESS_ENDPOINT_SPEC.md.
+# Same region + volume as the render endpoint is a HARD requirement.
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 COMFY_DIR=/opt/ComfyUI
+WORKDIR /opt
+
+# ffmpeg for VHS h264 mp4 output (prep writes mp4 directly — no webp dance on workers).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
+# ComfyUI + the custom nodes the preprocess graph needs.
+# NOTE: LoaderGGUF comes from calcuis/gguf (NOT city96/ComfyUI-GGUF — different class names).
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
+ && cd /opt/ComfyUI/custom_nodes \
+ && git clone --depth 1 https://github.com/1038lab/ComfyUI-RMBG comfyui-rmbg \
+ && git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux \
+ && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
+ && git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes \
+ && git clone --depth 1 https://github.com/calcuis/gguf
+
+RUN python3.11 -m pip install -r /opt/ComfyUI/requirements.txt runpod requests \
+ && for d in /opt/ComfyUI/custom_nodes/*/; do \
+      if [ -f "$d/requirements.txt" ]; then python3.11 -m pip install -r "$d/requirements.txt"; fi; \
+    done
+
+# Anna's mask node (MaskAreaFilter w/ keep_largest) — vendored from this repo.
+COPY aivfx_masktools /opt/ComfyUI/custom_nodes/aivfx_masktools
+
+# Build-time import gate: fail the build if any graph-critical node class is missing.
+COPY handler_preprocess.py           /opt/handler_preprocess.py
+COPY comfy_launch.py                 /opt/comfy_launch.py
+COPY extra_model_paths_preprocess.yaml /opt/extra_model_paths.yaml
+RUN python3.11 -c "\
+import sys; sys.path.insert(0, '/opt/ComfyUI'); \
+import importlib; \
+mods = ['torch', 'cv2', 'runpod']; [importlib.import_module(m) for m in mods]; \
+print('IMG_ENV_OK preprocess image')"
+
+ENV EXTRA_MODEL_PATHS=/opt/extra_model_paths.yaml
+CMD ["python3.11", "-u", "/opt/handler_preprocess.py"]

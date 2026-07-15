@@ -26,6 +26,11 @@ RUN python3.11 -m pip install -r /opt/ComfyUI/requirements.txt runpod requests \
       if [ -f "$d/requirements.txt" ]; then python3.11 -m pip install -r "$d/requirements.txt"; fi; \
     done
 
+# Current ComfyUI's Qwen text encoder needs torch>=2.5 (enable_gqa kwarg in SDPA);
+# base image ships 2.4. Upgrade last so no node requirement downgrades it.
+RUN python3.11 -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
+ && python3.11 -c "import torch; v=tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); assert v >= (2,5), torch.__version__; print('torch OK', torch.__version__)"
+
 # Anna's mask node (MaskAreaFilter w/ keep_largest) — vendored from this repo.
 COPY aivfx_masktools /opt/ComfyUI/custom_nodes/aivfx_masktools
 

@@ -27,9 +27,12 @@ RUN python3.11 -m pip install -r /opt/ComfyUI/requirements.txt runpod requests \
     done
 
 # Current ComfyUI's Qwen text encoder needs torch>=2.5 (enable_gqa kwarg in SDPA);
-# base image ships 2.4. Upgrade last so no node requirement downgrades it.
-RUN python3.11 -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
- && python3.11 -c "import torch; v=tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); assert v >= (2,5), torch.__version__; print('torch OK', torch.__version__)"
+# base image ships 2.4. PINNED to 2.8 cu124 — the render image's proven combo — and
+# torchaudio upgraded IN LOCKSTEP (a mixed 2.4 torchaudio ABI-crashes node imports).
+# Installed last so no node requirement downgrades it.
+RUN python3.11 -m pip install --upgrade "torch==2.8.*" "torchvision==0.23.*" "torchaudio==2.8.*" \
+      --index-url https://download.pytorch.org/whl/cu124 \
+ && python3.11 -c "import torch, torchvision, torchaudio; v=tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); assert v >= (2,5), torch.__version__; print('torch OK', torch.__version__, torchvision.__version__, torchaudio.__version__)"
 
 # Anna's mask node (MaskAreaFilter w/ keep_largest) — vendored from this repo.
 COPY aivfx_masktools /opt/ComfyUI/custom_nodes/aivfx_masktools

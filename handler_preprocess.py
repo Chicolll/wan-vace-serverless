@@ -45,6 +45,19 @@ def _tail(path, n=40):
         return "<no log>"
 
 
+def _errs(path, n_ctx=20):
+    """Error-focused log digest: traceback/error lines first, then the last lines."""
+    try:
+        with open(path, errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return "<no log>"
+    keys = ("Traceback", "Error", "ERROR", "error:", "ModuleNotFound", "ImportError",
+            "AssertionError", "CUDA", "Killed", "Segmentation")
+    hits = [l for l in lines if any(k in l for k in keys)]
+    return "ERR LINES:\n" + "\n".join(hits[-30:]) + "\n--- LAST LINES:\n" + "\n".join(lines[-n_ctx:])
+
+
 def _http(path, payload=None, timeout=30):
     req = urllib.request.Request(URL + path,
         data=json.dumps(payload).encode() if payload is not None else None,
@@ -74,7 +87,7 @@ def ensure_comfy(deadline_s=240):
     t0 = time.time()
     while time.time() - t0 < deadline_s:
         if _comfy.poll() is not None:
-            raise RuntimeError(f"ComfyUI exited rc={_comfy.returncode}. log tail:\n{_tail(LOG)}")
+            raise RuntimeError(f"ComfyUI exited rc={_comfy.returncode}.\n{_errs(LOG)}")
         try:
             _http("/system_stats"); return
         except Exception:

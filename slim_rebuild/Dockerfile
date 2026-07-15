@@ -27,6 +27,9 @@ RUN git clone --depth 1 --branch v0.27.0 https://github.com/comfyanonymous/Comfy
  && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
  && git clone --depth 1 https://github.com/ClownsharkBatwing/RES4LYF \
  && find /opt/ComfyUI -name .git -type d -prune -exec rm -rf {} + \
+ # stock empty models/* dirs block the handler's volume symlinks (canary 7/15: unet listed `[]`
+ # because models/diffusion_models existed real-and-empty). Ship models/ empty; setup_models fills it.
+ && rm -rf /opt/ComfyUI/models && mkdir /opt/ComfyUI/models \
  && apt-get purge -y git && apt-get autoremove -y
 
 # torch trio from the cu128 index FIRST (exact live versions; pulls the nvidia-*-cu12 wheel set),

@@ -69,5 +69,12 @@ EOF
 # bake: bytecode + matplotlib font cache (the Dockerfile.bake wins, folded in)
 RUN python -m compileall -q -j0 /opt/ComfyUI || true
 RUN HOME=/root python -c "import matplotlib.font_manager as fm; fm.fontManager; print('fonts cached')"
+# bake the SQLite DB migrations: every container boot re-ran alembic 0001->0004 (~1.5 s measured
+# on the 7/15 CA-2 clean boot, comfy.log +6.3->+7.9 s). Boot comfy once on CPU at build so the
+# migrated DB ships in the image; the find gate FAILS the build if no DB was created.
+RUN cd /opt/ComfyUI && (timeout 90 python main.py --cpu > /tmp/bake_db.log 2>&1; true) \
+ && find user -name "*.db" -size +1k | grep -q . \
+ && echo "DB baked: $(find user -name '*.db')" \
+ || (tail -40 /tmp/bake_db.log; exit 1)
 
 CMD ["python", "-u", "/opt/handler_raylight.py"]

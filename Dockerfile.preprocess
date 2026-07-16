@@ -31,7 +31,7 @@ RUN python3.11 -m pip install -r /opt/ComfyUI/requirements.txt runpod requests \
 # torchaudio upgraded IN LOCKSTEP (a mixed 2.4 torchaudio ABI-crashes node imports).
 # Installed last so no node requirement downgrades it.
 RUN python3.11 -m pip install --upgrade "torch==2.8.*" "torchvision==0.23.*" "torchaudio==2.8.*" \
-      --index-url https://download.pytorch.org/whl/cu124 \
+      --index-url https://download.pytorch.org/whl/cu128 \
  && python3.11 -c "import torch, torchvision, torchaudio; v=tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); assert v >= (2,5), torch.__version__; print('torch OK', torch.__version__, torchvision.__version__, torchaudio.__version__)"
 
 # Anna's mask node (MaskAreaFilter w/ keep_largest) — vendored from this repo.

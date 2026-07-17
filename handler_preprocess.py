@@ -95,6 +95,45 @@ def ensure_comfy(deadline_s=240):
     raise RuntimeError(f"ComfyUI boot timeout. log tail:\n{_tail(LOG)}")
 
 
+def _node_watch(client_id, store):
+    """Crash-guarded per-node telemetry: record when each node starts executing via the
+    ComfyUI websocket. Never blocks or fails the job (partner principle)."""
+    try:
+        import websocket
+        ws = websocket.create_connection(
+            f"ws://127.0.0.1:{PORT}/ws?clientId={client_id}", timeout=10)
+        ws.settimeout(5)
+        store["ws"] = ws
+        while not store.get("stop"):
+            try:
+                msg = ws.recv()
+            except Exception:
+                continue
+            if not isinstance(msg, str):
+                continue
+            try:
+                j = json.loads(msg)
+            except ValueError:
+                continue
+            if j.get("type") == "executing":
+                store["events"].append((time.time(), (j.get("data") or {}).get("node")))
+    except Exception:
+        pass
+
+
+def _node_timings(events, graph, top_n=12):
+    """events = [(t, node_id|None)] start markers -> per-node durations, labeled by class_type."""
+    out = []
+    for i, (t, nid) in enumerate(events):
+        if nid is None:
+            continue
+        t_end = events[i + 1][0] if i + 1 < len(events) else t
+        cls = (graph.get(str(nid)) or {}).get("class_type", "?")
+        out.append({"node": str(nid), "class": cls, "s": round(t_end - t, 2)})
+    out.sort(key=lambda x: -x["s"])
+    return out[:top_n]
+
+
 def _find_newest(root, needle):
     best, best_m = None, -1
     for dirpath, _, files in os.walk(root):
@@ -141,11 +180,17 @@ def handler(job):
         if pref is not None:
             node["inputs"]["filename_prefix"] = f"job_{int(t0)}/" + pref
 
+    import threading
+    client_id = f"prep_{int(t0)}"
+    watch = {"events": [], "stop": False}
+    threading.Thread(target=_node_watch, args=(client_id, watch), daemon=True).start()
     try:
-        pid = _http("/prompt", {"prompt": graph}).get("prompt_id")
+        pid = _http("/prompt", {"prompt": graph, "client_id": client_id}).get("prompt_id")
     except RuntimeError as e:
+        watch["stop"] = True
         return {"error": "graph rejected", "detail": str(e)[:3000], "log_tail": _tail(LOG)}
     if not pid:
+        watch["stop"] = True
         return {"error": "submit failed", "log_tail": _tail(LOG)}
     deadline = time.time() + int(j.get("timeout_s", 1500))
     while True:
@@ -173,13 +218,19 @@ def handler(job):
         shutil.move(src, dst)
         written.append({"file": final, "bytes": os.path.getsize(dst)})
     shutil.rmtree(stage, ignore_errors=True)
+    watch["stop"] = True
+    try:
+        if watch.get("ws"): watch["ws"].close()
+    except Exception:
+        pass
     if missing:
         return {"error": "missing outputs", "missing": missing,
                 "written": written, "log_tail": _tail(LOG)}
     return {"written": written,
             "timing": {"boot_s": round(t_boot - t0, 1),
                        "graph_s": round(t_graph - t_boot, 1),
-                       "total_s": round(time.time() - t0, 1)}}
+                       "total_s": round(time.time() - t0, 1)},
+            "node_timings": _node_timings(watch["events"], graph)}
 
 
 runpod.serverless.start({"handler": handler})

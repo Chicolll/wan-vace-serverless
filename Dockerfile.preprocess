@@ -20,7 +20,8 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
  && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
  && git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes \
  && git clone --depth 1 https://github.com/calcuis/gguf \
- && git clone --depth 1 https://github.com/kijai/ComfyUI-WanAnimatePreprocess
+ && git clone --depth 1 https://github.com/kijai/ComfyUI-WanAnimatePreprocess \
+ && git clone --depth 1 https://github.com/kijai/ComfyUI-SCAIL-Pose
 
 RUN python3.11 -m pip install -r /opt/ComfyUI/requirements.txt runpod requests websocket-client \
  && for d in /opt/ComfyUI/custom_nodes/*/; do \

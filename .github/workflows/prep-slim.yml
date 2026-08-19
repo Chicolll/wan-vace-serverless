@@ -1,0 +1,58 @@
+name: prep-slim-image
+on:
+  push:
+    branches: [preprocess-endpoint]
+    paths:
+      - "Dockerfile.preprocess"
+      - "handler_preprocess.py"
+      - "prep_setup.py"
+      - "prep_warmup_graph.json"
+      - "gate_nodes.py"
+      - "extra_model_paths_preprocess.yaml"
+      - "aivfx_masktools/**"
+      - ".github/workflows/prep-slim.yml"
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: free runner disk
+        run: sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc || true
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.preprocess
+          push: true
+          # plain manifest, no OCI attestation index: RunPod's puller gets the
+          # simplest artifact and the size gate sees layers directly
+          provenance: false
+          tags: |
+            ghcr.io/chicolll/wan-vace-preprocess:slim-${{ github.sha }}
+            ghcr.io/chicolll/wan-vace-preprocess:latest
+      - name: size gate (<= 8 GiB compressed)
+        run: |
+          docker buildx imagetools inspect --raw ghcr.io/chicolll/wan-vace-preprocess:slim-${{ github.sha }} > /tmp/m.json
+          python3 - <<'EOF'
+          import json, subprocess, sys
+          m = json.load(open("/tmp/m.json"))
+          if "manifests" in m:
+              d = next(x["digest"] for x in m["manifests"]
+                       if x.get("platform", {}).get("architecture") == "amd64")
+              raw = subprocess.check_output(["docker", "buildx", "imagetools", "inspect", "--raw",
+                                             f"ghcr.io/chicolll/wan-vace-preprocess@{d}"])
+              m = json.loads(raw)
+          L = m["layers"]
+          assert L, "no layers resolved"
+          s = sum(l["size"] for l in L)
+          print(f"{s/2**30:.2f} GiB compressed across {len(L)} layers")
+          sys.exit(0 if s <= 8*2**30 else 1)
+          EOF

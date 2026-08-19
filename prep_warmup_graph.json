@@ -1,0 +1,18 @@
+{
+  "1":  {"class_type": "EmptyImage", "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}},
+  "2":  {"class_type": "SAM3Segment", "inputs": {"image": ["1", 0], "prompt": "person", "output_mode": "Merged", "confidence_threshold": 0.35, "max_segments": 0, "segment_pick": 0, "mask_blur": 0, "mask_offset": 0, "device": "Auto", "invert_output": false, "background": "Color", "background_color": "#808080", "unload_model": false}},
+  "3":  {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": "warmup_sam3"}},
+  "50": {"class_type": "LoaderGGUF", "inputs": {"gguf_name": "qwen/qwen-image-edit-2511-Q5_0.gguf"}},
+  "51": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["50", 0], "lora_name": "qwen/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors", "strength_model": 1}},
+  "52": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default"}},
+  "53": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+  "54": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["51", 0], "shift": 3}},
+  "58": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["52", 0], "prompt": "warmup"}},
+  "59": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["52", 0], "prompt": ""}},
+  "60": {"class_type": "EmptyImage", "inputs": {"width": 112, "height": 112, "batch_size": 1, "color": 0}},
+  "61": {"class_type": "FluxKontextImageScale", "inputs": {"image": ["60", 0]}},
+  "62": {"class_type": "VAEEncode", "inputs": {"pixels": ["61", 0], "vae": ["53", 0]}},
+  "63": {"class_type": "KSampler", "inputs": {"model": ["54", 0], "positive": ["58", 0], "negative": ["59", 0], "latent_image": ["62", 0], "seed": 1, "steps": 1, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1}},
+  "64": {"class_type": "VAEDecode", "inputs": {"samples": ["63", 0], "vae": ["53", 0]}},
+  "65": {"class_type": "SaveImage", "inputs": {"images": ["64", 0], "filename_prefix": "warmup_qwen"}}
+}

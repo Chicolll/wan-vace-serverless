@@ -1,53 +1,71 @@
-# Serverless worker image — PREPROCESS endpoint ("prep kitchen", 2026-07-15).
+# PREPROCESS endpoint image — SLIM, PINNED, GATED (2026-08-19).
+# Replaces the devel-base build (runpod/pytorch devel = multi-GiB toolchain bloat,
+# unpinned ComfyUI, superseded torch 2.4 layer). Pattern: the render side's
+# trueslim rebuild — python-slim base, CUDA userspace entirely from pip cu128
+# wheels, everything pinned, build-time node-class gate instead of hope.
 #
-# Runs Anna's unified preprocessing graph (SAM3 mask + baked/depth driving videos +
-# Qwen starter frames) on 1 GPU. Models NOT baked — they live on the network volume
-# (old MMZ layout: /runpod-volume/ComfyUI/models). Spec: aivfx-pipeline/PREPROCESS_ENDPOINT_SPEC.md.
-# Same region + volume as the render endpoint is a HARD requirement.
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
-ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 COMFY_DIR=/opt/ComfyUI
+# Models are NOT baked: host-NVMe model store (Chicolll/bg-replace-pipeline
+# edit-preproc pin) resolved at container start by prep_setup.py, with a
+# network-volume fallback. Same region + volume as the render endpoint is a
+# HARD requirement (prep writes render's inputs).
+FROM python:3.11-slim-bookworm
+
+ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 DEBIAN_FRONTEND=noninteractive \
+    COMFY_DIR=/opt/ComfyUI
 WORKDIR /opt
 
-# ffmpeg for VHS h264 mp4 output (prep writes mp4 directly — no webp dance on workers).
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+# opencv/SAM3 need libGL/glib; git only for the clone layer (purged after).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# ComfyUI + the custom nodes the preprocess graph needs.
-# NOTE: LoaderGGUF comes from calcuis/gguf (NOT city96/ComfyUI-GGUF — different class names).
-RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
+# ComfyUI pinned to a release (v0.33.1, has TextEncodeQwenImageEditPlus) and the
+# five node packs pinned to the 2026-08-19 HEAD SHAs the gate below validates.
+# LoaderGGUF comes from calcuis/gguf (NOT city96 — different class names).
+RUN git clone --depth 1 --branch v0.33.1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
  && cd /opt/ComfyUI/custom_nodes \
- && git clone --depth 1 https://github.com/1038lab/ComfyUI-RMBG comfyui-rmbg \
- && git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux \
- && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
- && git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes \
- && git clone --depth 1 https://github.com/calcuis/gguf \
- && git clone --depth 1 https://github.com/kijai/ComfyUI-WanAnimatePreprocess \
- && git clone --depth 1 https://github.com/kijai/ComfyUI-SCAIL-Pose
+ && git clone https://github.com/1038lab/ComfyUI-RMBG comfyui-rmbg \
+      && (cd comfyui-rmbg && git checkout 9edb2bec3900) \
+ && git clone https://github.com/Fannovel16/comfyui_controlnet_aux \
+      && (cd comfyui_controlnet_aux && git checkout e8b689a513c3) \
+ && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
+      && (cd ComfyUI-VideoHelperSuite && git checkout 4ee72c065db2) \
+ && git clone https://github.com/kijai/ComfyUI-KJNodes \
+      && (cd ComfyUI-KJNodes && git checkout 3f20054214fe) \
+ && git clone https://github.com/calcuis/gguf \
+      && (cd gguf && git checkout 452dfed232ca) \
+ && find /opt/ComfyUI -name .git -type d -prune -exec rm -rf {} +
 
-RUN python3.11 -m pip install -r /opt/ComfyUI/requirements.txt runpod requests websocket-client \
- && for d in /opt/ComfyUI/custom_nodes/*/; do \
-      if [ -f "$d/requirements.txt" ]; then python3.11 -m pip install -r "$d/requirements.txt"; fi; \
-    done
-
-# Current ComfyUI's Qwen text encoder needs torch>=2.5 (enable_gqa kwarg in SDPA);
-# base image ships 2.4. PINNED to 2.8 cu124 — the render image's proven combo — and
-# torchaudio upgraded IN LOCKSTEP (a mixed 2.4 torchaudio ABI-crashes node imports).
-# Installed last so no node requirement downgrades it.
-RUN python3.11 -m pip install --upgrade "torch==2.8.*" "torchvision==0.23.*" "torchaudio==2.8.*" \
-      --index-url https://download.pytorch.org/whl/cu128 \
- && python3.11 -c "import torch, torchvision, torchaudio; v=tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); assert v >= (2,5), torch.__version__; print('torch OK', torch.__version__, torchvision.__version__, torchaudio.__version__)"
-
-# Anna's mask node (MaskAreaFilter w/ keep_largest) — vendored from this repo.
+# Anna's mask node (MaskAreaFilter) — vendored, quality-load-bearing (06-30 halo lesson).
 COPY aivfx_masktools /opt/ComfyUI/custom_nodes/aivfx_masktools
 
-# Build-time import gate: fail the build if any graph-critical node class is missing.
-COPY handler_preprocess.py           /opt/handler_preprocess.py
-COPY comfy_launch.py                 /opt/comfy_launch.py
-COPY extra_model_paths_preprocess.yaml /opt/extra_model_paths.yaml
-RUN python3.11 -c "\
-import sys; sys.path.insert(0, '/opt/ComfyUI'); \
-import importlib; \
-mods = ['torch', 'cv2', 'runpod']; [importlib.import_module(m) for m in mods]; \
-print('IMG_ENV_OK preprocess image')"
+# Python deps: ComfyUI + node packs + worker runtime, then the torch cu128 trio
+# LAST so no node requirement can downgrade it (2.8/0.23/2.8 = the proven combo;
+# the cu128 wheels carry the whole CUDA userspace — no system toolkit).
+# imageio-ffmpeg supplies the ffmpeg binary for VHS h264 output (proven on the
+# render image; no apt ffmpeg).
+RUN python -m pip install -r /opt/ComfyUI/requirements.txt \
+        runpod requests websocket-client imageio-ffmpeg \
+ && for d in /opt/ComfyUI/custom_nodes/*/; do \
+      if [ -f "$d/requirements.txt" ]; then python -m pip install -r "$d/requirements.txt"; fi; \
+    done \
+ && python -m pip install --upgrade "torch==2.8.*" "torchvision==0.23.*" "torchaudio==2.8.*" \
+      --index-url https://download.pytorch.org/whl/cu128 \
+ && apt-get purge -y git && apt-get autoremove -y
 
-ENV EXTRA_MODEL_PATHS=/opt/extra_model_paths.yaml
-CMD ["python3.11", "-u", "/opt/handler_preprocess.py"]
+# Runtime files.
+COPY handler_preprocess.py             /opt/handler_preprocess.py
+COPY prep_setup.py                     /opt/prep_setup.py
+COPY prep_warmup_graph.json            /opt/prep_warmup_graph.json
+COPY extra_model_paths_preprocess.yaml /opt/extra_model_paths.yaml
+COPY gate_nodes.py                     /opt/gate_nodes.py
+
+# BUILD-TIME GATE: boot ComfyUI on CPU, assert every node class the preprocess
+# graph uses is registered, and bake the SQLite migrations + bytecode while at
+# it. A missing class fails the BUILD, not a GPU canary.
+RUN python /opt/gate_nodes.py \
+ && python -m compileall -q -j0 /opt/ComfyUI || true
+
+ENV EXTRA_MODEL_PATHS=/opt/extra_model_paths.yaml \
+    PREP_BOOT_WARMUP=1
+CMD ["python", "-u", "/opt/handler_preprocess.py"]

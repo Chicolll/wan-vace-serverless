@@ -25,6 +25,12 @@ import urllib.request
 
 import runpod
 
+# Container-start model wiring (host-NVMe store resolution + symlink tree +
+# aux-ckpts volume persistence). Runs before anything serves; its
+# PREP_HOSTSTORE_ACTIVE|ABSENT line is the log check that fast loads are on.
+import prep_setup
+prep_setup.run()
+
 VOL        = "/runpod-volume"
 COMFY_DIR  = os.environ.get("COMFY_DIR", "/opt/ComfyUI")
 INPUTS_DIR = os.environ.get("INPUTS_DIR", f"{VOL}/native-xdit/inputs")
@@ -232,5 +238,34 @@ def handler(job):
                        "total_s": round(time.time() - t0, 1)},
             "node_timings": _node_timings(watch["events"], graph)}
 
+
+def _boot_warmup():
+    """Load every model at container start (SAM3 + Qwen GGUF/LoRA/CLIP/VAE via a
+    tiny 1-step graph) so the first real job pays render time, not load time —
+    the render endpoint's proven boot-warmup pattern. Crash-guarded: a warmup
+    failure logs and serving proceeds; it must never take the worker down."""
+    try:
+        t0 = time.time()
+        ensure_comfy()
+        with open("/opt/prep_warmup_graph.json") as f:
+            g = json.load(f)
+        pid = _http("/prompt", {"prompt": g, "client_id": "boot_warmup"}).get("prompt_id")
+        deadline = time.time() + 420
+        while pid and time.time() < deadline:
+            h = _http(f"/history/{pid}")
+            if pid in h:
+                st = h[pid].get("status", {})
+                if st.get("completed") or st.get("status_str") in ("success", "error"):
+                    if st.get("status_str") == "error":
+                        print(f"BOOT_WARMUP graph error: {json.dumps(st)[:800]}", flush=True)
+                    break
+            time.sleep(2)
+        print(f"BOOT_WARMUP done in {time.time() - t0:.1f}s", flush=True)
+    except Exception as e:
+        print(f"BOOT_WARMUP skipped: {type(e).__name__}: {e}", flush=True)
+
+
+if os.environ.get("PREP_BOOT_WARMUP") == "1":
+    _boot_warmup()
 
 runpod.serverless.start({"handler": handler})

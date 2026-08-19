@@ -1,17 +1,27 @@
-# Preprocess endpoint model map — points ComfyUI at the network volume's OLD MMZ layout,
-# where all preprocess models already live (qwen GGUF/LoRA/CLIP/VAE, depth ckpt, sam3).
-# (The render endpoint uses runpod-slim/ComfyUI/models — different map, same volume.)
-volume:
-  base_path: /runpod-volume/ComfyUI/
+# Preprocess endpoint model map (2026-08-19, our-account deployment).
+# Primary: /opt/prep_models — a symlink tree prep_setup.py builds at container
+# start, pointing at the host-NVMe model store when staged (fast path) or the
+# network-volume fallback when not. The graph's reference names (qwen/ subpaths
+# for GGUF+LoRA, flat for the rest) resolve identically either way.
+prep:
+  base_path: /opt/prep_models/
   is_default: true
-  checkpoints: models/checkpoints/
-  clip: models/clip/
-  text_encoders: models/text_encoders/
-  vae: models/vae/
-  loras: models/loras/
-  unet: models/unet/
-  diffusion_models: models/diffusion_models/
-  gguf: models/unet/gguf/
-  sam3: models/sam3/
-  controlnet_aux: models/controlnet_aux/
-  custom_nodes_models: models/
+  unet: unet/
+  gguf: unet/
+  diffusion_models: unet/
+  loras: loras/
+  clip: text_encoders/
+  text_encoders: text_encoders/
+  vae: vae/
+  sam3: sam3/
+# Volume fallback tree also exposed directly (anything staged only on the
+# volume — extra ckpts, future models — stays loadable without a rebuild).
+volume:
+  base_path: /runpod-volume/prep-models/ComfyUI/models/
+  unet: unet/
+  gguf: unet/
+  loras: loras/
+  clip: text_encoders/
+  text_encoders: text_encoders/
+  vae: vae/
+  sam3: sam3/

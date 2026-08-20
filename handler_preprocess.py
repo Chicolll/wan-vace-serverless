@@ -189,20 +189,36 @@ def handler(job):
         got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
         while attempts < 10:
             attempts += 1
+            if expected is not None and got > expected:
+                # Oversized partial = a previous resume appended a full-restart
+                # response (server ignored the Range; observed 8/19 at exactly
+                # +1 MiB). Corrupt by definition — restart clean.
+                print(f"fetch: oversized partial {got}>{expected}, restarting", flush=True)
+                os.remove(tmp)
+                got = 0
             try:
                 req = urllib.request.Request(url)
                 if got:
                     req.add_header("Range", f"bytes={got}-")
-                with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "ab" if got else "wb") as f:
-                    if expected is None:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    status = getattr(r, "status", 200)
+                    if got and status != 206:
+                        # Server ignored the Range — this response is the FULL
+                        # file; appending it would corrupt. Restart from zero.
+                        print(f"fetch: Range ignored (HTTP {status}), restarting", flush=True)
+                        mode, got = "wb", 0
+                    else:
+                        mode = "ab" if got else "wb"
+                    if expected is None and not got:
                         cl = r.headers.get("Content-Length")
-                        if cl and not got:
+                        if cl and status == 200:
                             expected = int(cl)
-                    shutil.copyfileobj(r, f, length=1 << 20)
+                    with open(tmp, mode) as f:
+                        shutil.copyfileobj(r, f, length=1 << 20)
             except Exception as e:  # noqa: BLE001 — transient network; retry from offset
                 print(f"fetch attempt {attempts} error at {got}B: {type(e).__name__}: {e}", flush=True)
             got = os.path.getsize(tmp)
-            if expected is not None and got >= expected:
+            if expected is not None and got == expected:
                 break
             if expected is None:
                 break  # no size to verify against; single best-effort pass

@@ -172,6 +172,7 @@ def handler(job):
                 "inputs_sample": sorted(os.listdir(INPUTS_DIR))[:20] if os.path.isdir(INPUTS_DIR) else []}
     if j.get("fetch"):
         url, dest = j["fetch"]["url"], j["fetch"]["dest"]
+        expected = j["fetch"].get("bytes")  # optional: enables resume + integrity
         if ".." in dest or dest.startswith("/"):
             return {"error": "dest must be a relative volume path"}
         path = os.path.join(VOL, dest)
@@ -180,10 +181,38 @@ def handler(job):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.time()
         tmp = path + ".part"
-        with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
-            shutil.copyfileobj(r, f, length=1 << 20)
+        # Resumable download: long streams drop mid-transfer and a dropped
+        # connection reads as EOF (8/19: sam3.pt committed at 1.9 of 3.4 GB
+        # TWICE) — so retry with Range from the .part offset until the size
+        # matches, and never commit a byte count we can't verify.
+        attempts = 0
+        got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        while attempts < 10:
+            attempts += 1
+            try:
+                req = urllib.request.Request(url)
+                if got:
+                    req.add_header("Range", f"bytes={got}-")
+                with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "ab" if got else "wb") as f:
+                    if expected is None:
+                        cl = r.headers.get("Content-Length")
+                        if cl and not got:
+                            expected = int(cl)
+                    shutil.copyfileobj(r, f, length=1 << 20)
+            except Exception as e:  # noqa: BLE001 — transient network; retry from offset
+                print(f"fetch attempt {attempts} error at {got}B: {type(e).__name__}: {e}", flush=True)
+            got = os.path.getsize(tmp)
+            if expected is not None and got >= expected:
+                break
+            if expected is None:
+                break  # no size to verify against; single best-effort pass
+            time.sleep(min(30, 3 * attempts))
+        if expected is not None and got != expected:
+            return {"error": f"fetch incomplete after {attempts} attempts: {got}/{expected} bytes",
+                    "fetched": dest, "bytes": got}
         os.replace(tmp, path)
-        return {"fetched": dest, "bytes": os.path.getsize(path), "secs": round(time.time() - t0, 1)}
+        return {"fetched": dest, "bytes": os.path.getsize(path),
+                "secs": round(time.time() - t0, 1), "attempts": attempts}
     graph, outputs = j.get("graph"), j.get("outputs") or {}
     if not graph or not outputs:
         return {"error": "need input.graph and input.outputs"}

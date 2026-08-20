@@ -154,9 +154,21 @@ def _find_newest(root, needle):
 def handler(job):
     j = job.get("input") or {}
     if j.get("debug"):
+        import glob as _glob
+        hs_snaps = _glob.glob("/runpod/model-store/huggingface/Chicolll/bg-replace-pipeline/*/snapshots/*/")
+        vol_models = f"{VOL}/prep-models/ComfyUI/models"
+        vol_listing = {}
+        for sub in ("unet", "loras", "text_encoders", "vae", "sam3"):
+            p = os.path.join(vol_models, sub)
+            vol_listing[sub] = sorted(os.listdir(p)) if os.path.isdir(p) else None
         return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR,
                 "inputs_dir_exists": os.path.isdir(INPUTS_DIR),
                 "stage_dir": STAGE_DIR, "emp_exists": os.path.isfile(EMP),
+                # model visibility — the 8/19 failure needed console archaeology
+                # to learn the hoststore never staged; now the ping says it.
+                "hoststore_snapshots": hs_snaps,
+                "hoststore_contents": {s: sorted(os.listdir(s))[:10] for s in hs_snaps},
+                "volume_models": vol_listing,
                 "inputs_sample": sorted(os.listdir(INPUTS_DIR))[:20] if os.path.isdir(INPUTS_DIR) else []}
     if j.get("fetch"):
         url, dest = j["fetch"]["url"], j["fetch"]["dest"]

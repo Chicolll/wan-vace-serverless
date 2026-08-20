@@ -30,7 +30,13 @@ def _link(src: str, dst: str) -> None:
 
 
 def run() -> str:
-    snaps = sorted(glob.glob(HS_GLOB), key=os.path.getmtime)
+    # Hosts are shared with the render endpoint, which stages a DIFFERENT
+    # snapshot of the same HF repo (video-only, no sam3/qwen). Only snapshots
+    # that actually contain the prep set qualify; freshest of those wins.
+    snaps = sorted(
+        (s for s in glob.glob(HS_GLOB) if os.path.isdir(os.path.join(s, "sam3"))),
+        key=os.path.getmtime,
+    )
     hs = snaps[-1] if snaps else None
 
     for sub in ("unet", "loras", "text_encoders", "vae", "sam3"):

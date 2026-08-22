@@ -32,6 +32,21 @@ import prep_setup
 prep_setup.run()
 
 VOL        = "/runpod-volume"
+
+_GPU_INFO = None
+def _gpu_info():
+    """Which GPU this worker landed on (name, total MiB) — reported in every
+    job result so per-job cost/placement can be analyzed from telemetry
+    (capacity-strategy design L8). Cached; nvidia-smi is always present."""
+    global _GPU_INFO
+    if _GPU_INFO is None:
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+            _GPU_INFO = [{"name": l.split(",")[0].strip(), "mem_mib": int(float(l.split(",")[1]))} for l in out if "," in l] or None
+        except Exception as e:
+            _GPU_INFO = {"error": str(e)[:80]}
+    return _GPU_INFO
 COMFY_DIR  = os.environ.get("COMFY_DIR", "/opt/ComfyUI")
 INPUTS_DIR = os.environ.get("INPUTS_DIR", f"{VOL}/native-xdit/inputs")
 STAGE_DIR  = os.environ.get("STAGE_DIR", f"{VOL}/native-xdit/prep_stage")
@@ -161,7 +176,7 @@ def handler(job):
         for sub in ("unet", "loras", "text_encoders", "vae", "sam3"):
             p = os.path.join(vol_models, sub)
             vol_listing[sub] = sorted(os.listdir(p)) if os.path.isdir(p) else None
-        return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR,
+        return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR, "gpu": _gpu_info(),
                 "inputs_dir_exists": os.path.isdir(INPUTS_DIR),
                 "stage_dir": STAGE_DIR, "emp_exists": os.path.isfile(EMP),
                 # model visibility — the 8/19 failure needed console archaeology
@@ -289,7 +304,7 @@ def handler(job):
     if missing:
         return {"error": "missing outputs", "missing": missing,
                 "written": written, "log_tail": _tail(LOG)}
-    return {"written": written,
+    return {"written": written, "gpu": _gpu_info(),
             "timing": {"boot_s": round(t_boot - t0, 1),
                        "graph_s": round(t_graph - t_boot, 1),
                        "total_s": round(time.time() - t0, 1)},

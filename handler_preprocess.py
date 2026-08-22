@@ -28,10 +28,23 @@ import runpod
 # Container-start model wiring (host-NVMe store resolution + symlink tree +
 # aux-ckpts volume persistence). Runs before anything serves; its
 # PREP_HOSTSTORE_ACTIVE|ABSENT line is the log check that fast loads are on.
+_T_IMPORT = time.time()  # boot timeline origin: the handler process is up
 import prep_setup
-prep_setup.run()
+_SETUP_STATE = prep_setup.run()
+_T_SETUP = time.time()
 
 VOL        = "/runpod-volume"
+
+# Boot timeline (cold-start decomposition; ledger #5 / capacity design). Filled
+# in as the worker boots and reported in EVERY job result + debug ping, so the
+# backend's per-leg telemetry records it on a cold worker's first job without
+# anyone reading container logs. All seconds, measured in-process; the part
+# before the process exists (placement, image pull) is RunPod's delayTime
+# minus ready_after_import_s.
+BOOT = {"import_epoch": round(_T_IMPORT, 3),
+        "setup_s": round(_T_SETUP - _T_IMPORT, 1),
+        "model_store": _SETUP_STATE,
+        "warmup": "pending"}
 
 _GPU_INFO = None
 def _gpu_info():
@@ -176,7 +189,7 @@ def handler(job):
         for sub in ("unet", "loras", "text_encoders", "vae", "sam3"):
             p = os.path.join(vol_models, sub)
             vol_listing[sub] = sorted(os.listdir(p)) if os.path.isdir(p) else None
-        return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR, "gpu": _gpu_info(),
+        return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR, "gpu": _gpu_info(), "boot": BOOT,
                 "inputs_dir_exists": os.path.isdir(INPUTS_DIR),
                 "stage_dir": STAGE_DIR, "emp_exists": os.path.isfile(EMP),
                 # model visibility — the 8/19 failure needed console archaeology
@@ -192,7 +205,7 @@ def handler(job):
             return {"error": "dest must be a relative volume path"}
         path = os.path.join(VOL, dest)
         if os.path.exists(path) and not j["fetch"].get("overwrite"):
-            return {"fetched": dest, "bytes": os.path.getsize(path), "skipped": "already exists"}
+            return {"fetched": dest, "boot": BOOT, "gpu": _gpu_info(), "bytes": os.path.getsize(path), "skipped": "already exists"}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.time()
         tmp = path + ".part"
@@ -242,7 +255,7 @@ def handler(job):
             return {"error": f"fetch incomplete after {attempts} attempts: {got}/{expected} bytes",
                     "fetched": dest, "bytes": got}
         os.replace(tmp, path)
-        return {"fetched": dest, "bytes": os.path.getsize(path),
+        return {"fetched": dest, "boot": BOOT, "gpu": _gpu_info(), "bytes": os.path.getsize(path),
                 "secs": round(time.time() - t0, 1), "attempts": attempts}
     graph, outputs = j.get("graph"), j.get("outputs") or {}
     if not graph or not outputs:
@@ -304,7 +317,7 @@ def handler(job):
     if missing:
         return {"error": "missing outputs", "missing": missing,
                 "written": written, "log_tail": _tail(LOG)}
-    return {"written": written, "gpu": _gpu_info(),
+    return {"written": written, "gpu": _gpu_info(), "boot": BOOT,
             "timing": {"boot_s": round(t_boot - t0, 1),
                        "graph_s": round(t_graph - t_boot, 1),
                        "total_s": round(time.time() - t0, 1)},
@@ -319,25 +332,49 @@ def _boot_warmup():
     try:
         t0 = time.time()
         ensure_comfy()
+        t_comfy = time.time()
+        BOOT["comfy_boot_s"] = round(t_comfy - t0, 1)
         with open("/opt/prep_warmup_graph.json") as f:
             g = json.load(f)
+        # Per-node timings of the warmup graph = per-model LOAD times (SAM3,
+        # Qwen GGUF, CLIP, VAE, ...) — the numbers that say where a cold boot
+        # spends its time and whether the model store is doing its job.
+        import threading
+        watch = {"events": [], "stop": False}
+        threading.Thread(target=_node_watch, args=("boot_warmup", watch), daemon=True).start()
         pid = _http("/prompt", {"prompt": g, "client_id": "boot_warmup"}).get("prompt_id")
         deadline = time.time() + 420
+        ok = False
         while pid and time.time() < deadline:
             h = _http(f"/history/{pid}")
             if pid in h:
                 st = h[pid].get("status", {})
                 if st.get("completed") or st.get("status_str") in ("success", "error"):
-                    if st.get("status_str") == "error":
+                    ok = st.get("status_str") != "error"
+                    if not ok:
                         print(f"BOOT_WARMUP graph error: {json.dumps(st)[:800]}", flush=True)
                     break
             time.sleep(2)
-        print(f"BOOT_WARMUP done in {time.time() - t0:.1f}s", flush=True)
+        watch["stop"] = True
+        try:
+            if watch.get("ws"): watch["ws"].close()
+        except Exception:
+            pass
+        BOOT["warmup_s"] = round(time.time() - t_comfy, 1)
+        BOOT["warmup"] = "ok" if ok else "error"
+        BOOT["warmup_nodes"] = _node_timings(watch["events"], g, top_n=8)
+        BOOT["ready_after_import_s"] = round(time.time() - _T_IMPORT, 1)
+        print(f"BOOT_WARMUP done in {time.time() - t0:.1f}s {json.dumps(BOOT)}", flush=True)
     except Exception as e:
+        BOOT["warmup"] = f"skipped: {type(e).__name__}: {str(e)[:120]}"
+        BOOT["ready_after_import_s"] = round(time.time() - _T_IMPORT, 1)
         print(f"BOOT_WARMUP skipped: {type(e).__name__}: {e}", flush=True)
 
 
 if os.environ.get("PREP_BOOT_WARMUP") == "1":
     _boot_warmup()
+else:
+    BOOT["warmup"] = "disabled"
+    BOOT["ready_after_import_s"] = round(time.time() - _T_IMPORT, 1)
 
 runpod.serverless.start({"handler": handler})

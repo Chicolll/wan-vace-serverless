@@ -19,7 +19,7 @@ Output files land in INPUTS_DIR (default /runpod-volume/native-xdit/inputs) —
 flat folder, collision-proof names are the CLIENT's job (bake the date into the
 tag, e.g. DRIVING-D2-0715-BAKED.mp4). See PREPROCESS_ENDPOINT_SPEC.md.
 """
-import json, os, shutil, subprocess, sys, time
+import json, os, shutil, subprocess, sys, threading, time
 import urllib.error
 import urllib.request
 
@@ -29,6 +29,35 @@ import runpod
 # aux-ckpts volume persistence). Runs before anything serves; its
 # PREP_HOSTSTORE_ACTIVE|ABSENT line is the log check that fast loads are on.
 _T_IMPORT = time.time()  # boot timeline origin: the handler process is up
+
+# Network-volume reads arrive over the network: sampling /proc/net/dev RX bytes
+# once a second during boot measures the model-load mechanism directly (bytes
+# and MB/s per warm-up node) instead of inferring it from wall-clock.
+_NET = {"samples": [], "stop": False}
+def _net_rx_bytes():
+    tot = 0
+    with open("/proc/net/dev") as f:
+        for line in f.readlines()[2:]:
+            name, data = line.split(":", 1)
+            if name.strip() == "lo":
+                continue
+            tot += int(data.split()[0])
+    return tot
+def _net_sampler():
+    while not _NET["stop"]:
+        try:
+            _NET["samples"].append((time.time(), _net_rx_bytes()))
+        except Exception:
+            pass
+        time.sleep(1)
+threading.Thread(target=_net_sampler, daemon=True).start()
+def _net_window(t_a, t_b):
+    """RX bytes received in [t_a, t_b] and the peak 1 s rate (MB/s) inside it."""
+    pts = [(t, b) for t, b in _NET["samples"] if t_a - 1 <= t <= t_b + 1]
+    if len(pts) < 2:
+        return {"gb": None, "peak_mbs": None}
+    peak = max((b2 - b1) / max(t2 - t1, 1e-6) for (t1, b1), (t2, b2) in zip(pts, pts[1:]))
+    return {"gb": round((pts[-1][1] - pts[0][1]) / 2**30, 2), "peak_mbs": round(peak / 2**20)}
 import prep_setup
 _SETUP_STATE = prep_setup.run()
 _T_SETUP = time.time()
@@ -103,8 +132,15 @@ def _http(path, payload=None, timeout=30):
         raise RuntimeError(f"ComfyUI {path} HTTP {e.code}: {body}")
 
 
+_COMFY_LOCK = threading.Lock()
 def ensure_comfy(deadline_s=240):
-    """Boot ComfyUI once per worker; reuse the warm process across jobs."""
+    """Boot ComfyUI once per worker; reuse the warm process across jobs.
+    Serialized: the background warm-up and the first job may both call it."""
+    with _COMFY_LOCK:
+        return _ensure_comfy_locked(deadline_s)
+
+
+def _ensure_comfy_locked(deadline_s):
     global _comfy
     if _comfy is not None and _comfy.poll() is None:
         return
@@ -343,16 +379,19 @@ def _boot_warmup():
         watch = {"events": [], "stop": False}
         threading.Thread(target=_node_watch, args=("boot_warmup", watch), daemon=True).start()
         pid = _http("/prompt", {"prompt": g, "client_id": "boot_warmup"}).get("prompt_id")
-        deadline = time.time() + 420
-        ok = False
+        # Volume loads measured 8/21 at ~7 min on L40S; the wait must outlast
+        # them or the timeline is truncated (the graph keeps running regardless).
+        deadline = time.time() + 1200
+        outcome = "timeout"
         while pid and time.time() < deadline:
             h = _http(f"/history/{pid}")
             if pid in h:
                 st = h[pid].get("status", {})
                 if st.get("completed") or st.get("status_str") in ("success", "error"):
-                    ok = st.get("status_str") != "error"
-                    if not ok:
+                    outcome = "ok" if st.get("status_str") != "error" else "error"
+                    if outcome == "error":
                         print(f"BOOT_WARMUP graph error: {json.dumps(st)[:800]}", flush=True)
+                        BOOT["warmup_error"] = json.dumps(st)[:600]
                     break
             time.sleep(2)
         watch["stop"] = True
@@ -360,9 +399,21 @@ def _boot_warmup():
             if watch.get("ws"): watch["ws"].close()
         except Exception:
             pass
-        BOOT["warmup_s"] = round(time.time() - t_comfy, 1)
-        BOOT["warmup"] = "ok" if ok else "error"
-        BOOT["warmup_nodes"] = _node_timings(watch["events"], g, top_n=8)
+        t_end = time.time()
+        BOOT["warmup_s"] = round(t_end - t_comfy, 1)
+        BOOT["warmup"] = outcome
+        nodes = _node_timings(watch["events"], g, top_n=8)
+        # network bytes per node window = what each load actually pulled from the volume
+        ev = [(t, nid) for t, nid in watch["events"] if nid is not None]
+        for n in nodes:
+            for i, (t, nid) in enumerate(ev):
+                if str(nid) == n["node"]:
+                    t_next = ev[i + 1][0] if i + 1 < len(ev) else t_end
+                    n["net"] = _net_window(t, t_next)
+                    break
+        BOOT["warmup_nodes"] = nodes
+        BOOT["warmup_net"] = _net_window(t_comfy, t_end)
+        _NET["stop"] = True
         BOOT["ready_after_import_s"] = round(time.time() - _T_IMPORT, 1)
         print(f"BOOT_WARMUP done in {time.time() - t0:.1f}s {json.dumps(BOOT)}", flush=True)
     except Exception as e:
@@ -372,9 +423,16 @@ def _boot_warmup():
 
 
 if os.environ.get("PREP_BOOT_WARMUP") == "1":
-    _boot_warmup()
+    # NON-BLOCKING (8/21): serving starts immediately. A cold worker's first
+    # job is the backend's clip fetch (no ComfyUI) - it returns in seconds
+    # instead of waiting ~7 min behind the loads; the graph job then queues
+    # behind the warm-up prompt inside ComfyUI (sequential), so it starts
+    # exactly when the models are resident. Total latency unchanged, budgets
+    # and progress reporting honest.
+    threading.Thread(target=_boot_warmup, daemon=True).start()
 else:
     BOOT["warmup"] = "disabled"
     BOOT["ready_after_import_s"] = round(time.time() - _T_IMPORT, 1)
+    _NET["stop"] = True
 
 runpod.serverless.start({"handler": handler})

@@ -43,21 +43,42 @@ def _net_rx_bytes():
                 continue
             tot += int(data.split()[0])
     return tot
+def _comfy_rchar():
+    """Bytes ComfyUI has read via read() so far (/proc/<pid>/io rchar): the
+    direct measure of model-file reading even when the volume is host-mounted
+    (network counters inside the container see nothing then)."""
+    pid = _comfy.pid if (_comfy is not None and _comfy.poll() is None) else None
+    if not pid:
+        return None
+    with open(f"/proc/{pid}/io") as f:
+        for line in f:
+            if line.startswith("rchar:"):
+                return int(line.split()[1])
+    return None
 def _net_sampler():
     while not _NET["stop"]:
         try:
-            _NET["samples"].append((time.time(), _net_rx_bytes()))
+            _NET["samples"].append((time.time(), _net_rx_bytes(), _comfy_rchar()))
         except Exception:
             pass
         time.sleep(1)
 threading.Thread(target=_net_sampler, daemon=True).start()
 def _net_window(t_a, t_b):
-    """RX bytes received in [t_a, t_b] and the peak 1 s rate (MB/s) inside it."""
-    pts = [(t, b) for t, b in _NET["samples"] if t_a - 1 <= t <= t_b + 1]
+    """Bytes in [t_a, t_b] from two counters: container network RX (blind to a
+    host-mounted volume) and ComfyUI's read() bytes (rchar: the real load
+    progress), each with the peak 1 s rate (MB/s)."""
+    pts = [q for q in _NET["samples"] if t_a - 1 <= q[0] <= t_b + 1]
+    out = {"gb": None, "peak_mbs": None, "read_gb": None, "read_peak_mbs": None, "read_avg_mbs": None}
     if len(pts) < 2:
-        return {"gb": None, "peak_mbs": None}
-    peak = max((b2 - b1) / max(t2 - t1, 1e-6) for (t1, b1), (t2, b2) in zip(pts, pts[1:]))
-    return {"gb": round((pts[-1][1] - pts[0][1]) / 2**30, 2), "peak_mbs": round(peak / 2**20)}
+        return out
+    out["gb"] = round((pts[-1][1] - pts[0][1]) / 2**30, 2)
+    out["peak_mbs"] = round(max((q2[1] - q1[1]) / max(q2[0] - q1[0], 1e-6) for q1, q2 in zip(pts, pts[1:])) / 2**20)
+    rp = [(q[0], q[2]) for q in pts if len(q) > 2 and q[2] is not None]
+    if len(rp) >= 2:
+        out["read_gb"] = round((rp[-1][1] - rp[0][1]) / 2**30, 2)
+        out["read_peak_mbs"] = round(max((b2 - b1) / max(t2 - t1, 1e-6) for (t1, b1), (t2, b2) in zip(rp, rp[1:])) / 2**20)
+        out["read_avg_mbs"] = round((rp[-1][1] - rp[0][1]) / max(rp[-1][0] - rp[0][0], 1e-6) / 2**20, 1)
+    return out
 import prep_setup
 _SETUP_STATE = prep_setup.run()
 _T_SETUP = time.time()
@@ -233,8 +254,12 @@ def handler(job):
         net_now = None
         if len(pts) >= 2:
             recent = [q for q in pts if q[0] >= pts[-1][0] - 10] or pts[-2:]
+            rp = [(q[0], q[2]) for q in pts if len(q) > 2 and q[2] is not None]
+            rrecent = [q for q in rp if q[0] >= rp[-1][0] - 10] if rp else []
             net_now = {"rx_gb_since_import": round((pts[-1][1] - pts[0][1]) / 2**30, 2),
                        "rate_mbs_last_10s": round((recent[-1][1] - recent[0][1]) / max(recent[-1][0] - recent[0][0], 1e-6) / 2**20, 1),
+                       "comfy_read_gb": (round((rp[-1][1] - rp[0][1]) / 2**30, 2) if len(rp) >= 2 else None),
+                       "comfy_read_mbs_last_10s": (round((rrecent[-1][1] - rrecent[0][1]) / max(rrecent[-1][0] - rrecent[0][0], 1e-6) / 2**20, 1) if len(rrecent) >= 2 else None),
                        "sampler_alive": not _NET["stop"], "age_s": round(time.time() - _T_IMPORT, 1)}
         return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR, "gpu": _gpu_info(), "boot": BOOT,
                 "net_now": net_now, "comfy_log_tail": _tail(LOG, 30), "comfy_alive": (_comfy is not None and _comfy.poll() is None),

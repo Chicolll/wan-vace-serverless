@@ -133,7 +133,43 @@ def _read_seq(path, limit_bytes=None, chunk=32 * 2**20):
     return {"path": path, "gb": round(n / 2**30, 2), "s": round(dt, 1), "mbs": round(n / dt / 2**20)}
 
 
-def _prewarm_models(root=PREP_MODELS_ROOT, threads=4, min_bytes=8 * 2**20):
+def _read_ranged(path, streams=16, chunk=16 * 2**20, limit_bytes=None, offset=0):
+    """Read a file region with `streams` threads doing pread() on interleaved
+    chunks — parallel ranged reads are what a latency-bound network volume
+    needs (measured 8/21: one stream = ~38 MB/s). Same page-cache side effect."""
+    size = os.path.getsize(path)
+    end = min(size, offset + limit_bytes) if limit_bytes else size
+    total = max(0, end - offset)
+    n_chunks = (total + chunk - 1) // chunk
+    fd = os.open(path, os.O_RDONLY)
+    done = [0]
+    lock = threading.Lock()
+    def worker(start_idx):
+        got = 0
+        for i in range(start_idx, n_chunks, streams):
+            off = offset + i * chunk
+            want = min(chunk, end - off)
+            pos = 0
+            while pos < want:
+                b = os.pread(fd, want - pos, off + pos)
+                if not b:
+                    break
+                pos += len(b)
+            got += pos
+        with lock:
+            done[0] += got
+    t0 = time.time()
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        with ThreadPoolExecutor(max_workers=streams) as ex:
+            list(ex.map(worker, range(min(streams, max(n_chunks, 1)))))
+    finally:
+        os.close(fd)
+    dt = max(time.time() - t0, 1e-6)
+    return {"path": path, "gb": round(done[0] / 2**30, 2), "s": round(dt, 1), "mbs": round(done[0] / dt / 2**20), "streams": streams}
+
+
+def _prewarm_models(root=PREP_MODELS_ROOT, threads=None, min_bytes=8 * 2**20):
     """Read every model file under the prep model tree sequentially into the
     page cache (several files in parallel). Returns per-file and total rates."""
     files = []
@@ -147,15 +183,16 @@ def _prewarm_models(root=PREP_MODELS_ROOT, threads=4, min_bytes=8 * 2**20):
             except OSError:
                 pass
     files = sorted(set(files), key=lambda x: -os.path.getsize(x))
-    out = {"files": [], "n": len(files)}
+    streams = int(threads or os.environ.get("PREP_PREWARM_STREAMS", "16"))
+    out = {"files": [], "n": len(files), "streams": streams}
     t0 = time.time()
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        for r in ex.map(lambda fp: _read_seq(fp), files):
-            out["files"].append(r)
+    # files one after another, each with `streams` parallel ranged readers
+    # (total concurrency stays bounded; the big files dominate anyway)
+    for fp in files:
+        out["files"].append(_read_ranged(fp, streams=streams))
     dt = max(time.time() - t0, 1e-6)
     tot = sum(r["gb"] for r in out["files"])
-    out.update({"total_gb": round(tot, 2), "s": round(dt, 1), "mbs": round(tot * 1024 / dt), "threads": threads})
+    out.update({"total_gb": round(tot, 2), "s": round(dt, 1), "mbs": round(tot * 1024 / dt)})
     return out
 
 INPUTS_DIR = os.environ.get("INPUTS_DIR", f"{VOL}/native-xdit/inputs")
@@ -319,6 +356,45 @@ def handler(job):
                 "hoststore_contents": {s: sorted(os.listdir(s))[:10] for s in hs_snaps},
                 "volume_models": vol_listing,
                 "inputs_sample": sorted(os.listdir(INPUTS_DIR))[:20] if os.path.isdir(INPUTS_DIR) else []}
+    if j.get("iobench_par"):
+        # Stream-count sweep: for each N, read `mb` MiB from a DIFFERENT region
+        # of the file (so every pass hits uncached bytes) with N parallel
+        # ranged readers. Finds the volume's parallelism knee on a warm worker.
+        spec = j["iobench_par"]
+        pth = os.path.realpath(spec.get("path") or os.path.join(PREP_MODELS_ROOT, "unet", "qwen-image-edit-2511-Q5_0.gguf"))
+        limit = int(spec.get("mb", 1024)) * 2**20
+        res = []
+        off = int(spec.get("offset_mb", 0)) * 2**20
+        for n in spec.get("streams", [1, 4, 8, 16, 32]):
+            try:
+                r = _read_ranged(pth, streams=int(n), limit_bytes=limit, offset=off)
+                r["offset_gb"] = round(off / 2**30, 2)
+                res.append(r)
+            except Exception as e:
+                res.append({"streams": n, "error": str(e)[:160]})
+            off += limit
+        return {"iobench_par": res, "gpu": _gpu_info(), "boot": BOOT}
+    if j.get("find_big"):
+        # Files >= min_gb under a root (depth-limited, time-capped): pick
+        # uncached benchmark targets without guessing paths.
+        spec = j["find_big"]
+        root = spec.get("root", VOL); depth = int(spec.get("depth", 3)); min_b = float(spec.get("min_gb", 1)) * 2**30
+        t0 = time.time(); hits = []
+        for dp, dns, fns in os.walk(root):
+            if dp[len(root):].count(os.sep) >= depth:
+                dns[:] = []
+            for fn in fns:
+                fp = os.path.join(dp, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                    if sz >= min_b:
+                        hits.append({"path": fp, "gb": round(sz / 2**30, 2)})
+                except OSError:
+                    pass
+            if time.time() - t0 > float(spec.get("cap_s", 20)):
+                break
+        hits.sort(key=lambda h: -h["gb"])
+        return {"find_big": hits[:40], "scan_s": round(time.time() - t0, 1)}
     if j.get("iobench"):
         # Sequential-read benchmark of one or more files (default: the SAM3
         # weights), N MiB each: answers "is the volume slow, or is lazy mmap

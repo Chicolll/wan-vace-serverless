@@ -225,7 +225,20 @@ def handler(job):
         for sub in ("unet", "loras", "text_encoders", "vae", "sam3"):
             p = os.path.join(vol_models, sub)
             vol_listing[sub] = sorted(os.listdir(p)) if os.path.isdir(p) else None
+        # Live view while a warm-up is still running: ComfyUI's own log tail
+        # (what it is loading / any error), network RX so far + the rate over
+        # the last ~10 s (volume reads happen over the network), and the
+        # warm-up nodes seen so far. Lets a ping mid-boot show the mechanism.
+        pts = _NET["samples"]
+        net_now = None
+        if len(pts) >= 2:
+            recent = [q for q in pts if q[0] >= pts[-1][0] - 10] or pts[-2:]
+            net_now = {"rx_gb_since_import": round((pts[-1][1] - pts[0][1]) / 2**30, 2),
+                       "rate_mbs_last_10s": round((recent[-1][1] - recent[0][1]) / max(recent[-1][0] - recent[0][0], 1e-6) / 2**20, 1),
+                       "sampler_alive": not _NET["stop"], "age_s": round(time.time() - _T_IMPORT, 1)}
         return {"comfy_dir": COMFY_DIR, "inputs_dir": INPUTS_DIR, "gpu": _gpu_info(), "boot": BOOT,
+                "net_now": net_now, "comfy_log_tail": _tail(LOG, 30), "comfy_alive": (_comfy is not None and _comfy.poll() is None),
+                "warmup_events_so_far": [(round(t - _T_IMPORT, 1), nid) for t, nid in (_WARM_WATCH.get("events") or [])][-12:],
                 "inputs_dir_exists": os.path.isdir(INPUTS_DIR),
                 "stage_dir": STAGE_DIR, "emp_exists": os.path.isfile(EMP),
                 # model visibility — the 8/19 failure needed console archaeology
@@ -360,6 +373,9 @@ def handler(job):
             "node_timings": _node_timings(watch["events"], graph)}
 
 
+_WARM_WATCH = {"events": [], "stop": False}
+
+
 def _boot_warmup():
     """Load every model at container start (SAM3 + Qwen GGUF/LoRA/CLIP/VAE via a
     tiny 1-step graph) so the first real job pays render time, not load time —
@@ -375,8 +391,7 @@ def _boot_warmup():
         # Per-node timings of the warmup graph = per-model LOAD times (SAM3,
         # Qwen GGUF, CLIP, VAE, ...) — the numbers that say where a cold boot
         # spends its time and whether the model store is doing its job.
-        import threading
-        watch = {"events": [], "stop": False}
+        watch = _WARM_WATCH
         threading.Thread(target=_node_watch, args=("boot_warmup", watch), daemon=True).start()
         pid = _http("/prompt", {"prompt": g, "client_id": "boot_warmup"}).get("prompt_id")
         # Volume loads measured 8/21 at ~7 min on L40S; the wait must outlast

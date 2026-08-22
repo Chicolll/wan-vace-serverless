@@ -111,6 +111,53 @@ def _gpu_info():
             _GPU_INFO = {"error": str(e)[:80]}
     return _GPU_INFO
 COMFY_DIR  = os.environ.get("COMFY_DIR", "/opt/ComfyUI")
+PREP_MODELS_ROOT = "/opt/prep_models"  # symlink tree -> host store or volume (prep_setup)
+
+
+def _read_seq(path, limit_bytes=None, chunk=32 * 2**20):
+    """Sequential read of a file with big chunks (what the network volume is
+    good at). Returns bytes read, seconds, MB/s. Side effect: the file lands in
+    the host page cache, so later lazy (mmap) loads hit RAM instead of the
+    network — the render endpoint's proven shard-prewarm pattern."""
+    n = 0
+    t0 = time.time()
+    with open(path, "rb", buffering=0) as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            n += len(b)
+            if limit_bytes and n >= limit_bytes:
+                break
+    dt = max(time.time() - t0, 1e-6)
+    return {"path": path, "gb": round(n / 2**30, 2), "s": round(dt, 1), "mbs": round(n / dt / 2**20)}
+
+
+def _prewarm_models(root=PREP_MODELS_ROOT, threads=4, min_bytes=8 * 2**20):
+    """Read every model file under the prep model tree sequentially into the
+    page cache (several files in parallel). Returns per-file and total rates."""
+    files = []
+    for dp, _, fs in os.walk(root, followlinks=True):
+        for fn in fs:
+            fp = os.path.join(dp, fn)
+            try:
+                rp = os.path.realpath(fp)
+                if os.path.isfile(rp) and os.path.getsize(rp) >= min_bytes:
+                    files.append(rp)
+            except OSError:
+                pass
+    files = sorted(set(files), key=lambda x: -os.path.getsize(x))
+    out = {"files": [], "n": len(files)}
+    t0 = time.time()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        for r in ex.map(lambda fp: _read_seq(fp), files):
+            out["files"].append(r)
+    dt = max(time.time() - t0, 1e-6)
+    tot = sum(r["gb"] for r in out["files"])
+    out.update({"total_gb": round(tot, 2), "s": round(dt, 1), "mbs": round(tot * 1024 / dt), "threads": threads})
+    return out
+
 INPUTS_DIR = os.environ.get("INPUTS_DIR", f"{VOL}/native-xdit/inputs")
 STAGE_DIR  = os.environ.get("STAGE_DIR", f"{VOL}/native-xdit/prep_stage")
 EMP        = os.environ.get("EXTRA_MODEL_PATHS", "/opt/extra_model_paths.yaml")
@@ -272,6 +319,20 @@ def handler(job):
                 "hoststore_contents": {s: sorted(os.listdir(s))[:10] for s in hs_snaps},
                 "volume_models": vol_listing,
                 "inputs_sample": sorted(os.listdir(INPUTS_DIR))[:20] if os.path.isdir(INPUTS_DIR) else []}
+    if j.get("iobench"):
+        # Sequential-read benchmark of one or more files (default: the SAM3
+        # weights), N MiB each: answers "is the volume slow, or is lazy mmap
+        # loading slow?" on a warm worker, no cold boot needed.
+        spec = j["iobench"]
+        paths = spec.get("paths") or [spec.get("path") or os.path.join(PREP_MODELS_ROOT, "sam3", "sam3.pt")]
+        limit = int(spec.get("mb", 1024)) * 2**20
+        res = []
+        for pth in paths:
+            try:
+                res.append(_read_seq(os.path.realpath(pth), limit_bytes=limit))
+            except Exception as e:
+                res.append({"path": pth, "error": str(e)[:160]})
+        return {"iobench": res, "gpu": _gpu_info(), "boot": BOOT}
     if j.get("fetch"):
         url, dest = j["fetch"]["url"], j["fetch"]["dest"]
         expected = j["fetch"].get("bytes")  # optional: enables resume + integrity
@@ -408,9 +469,20 @@ def _boot_warmup():
     failure logs and serving proceeds; it must never take the worker down."""
     try:
         t0 = time.time()
+        if os.environ.get("PREP_PREWARM", "1") == "1":
+            # Page-cache pre-warm FIRST: sequential big-chunk reads of all model
+            # files, so the lazy loads inside the graph hit RAM. Measured.
+            try:
+                BOOT["prewarm"] = _prewarm_models()
+            except Exception as e:
+                BOOT["prewarm"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+            BOOT["prewarm_s"] = round(time.time() - t0, 1)
+        else:
+            BOOT["prewarm"] = "disabled"
+        t_pw = time.time()
         ensure_comfy()
         t_comfy = time.time()
-        BOOT["comfy_boot_s"] = round(t_comfy - t0, 1)
+        BOOT["comfy_boot_s"] = round(t_comfy - t_pw, 1)
         with open("/opt/prep_warmup_graph.json") as f:
             g = json.load(f)
         # Per-node timings of the warmup graph = per-model LOAD times (SAM3,

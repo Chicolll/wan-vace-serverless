@@ -1,8 +1,9 @@
-"""Container-start model wiring for the preprocess endpoint (2026-08-19).
+"""Container-start model wiring for the preprocess endpoint (2026-08-19, repo split 2026-08-22).
 
 Replaces the dockerStartCmd shell approach with an importable, testable step
 the handler runs before serving. Resolves the host-NVMe model store
-(Chicolll/bg-replace-pipeline, edit-preproc pin) if this host has it staged,
+(Chicolll/bg-replace-preproc — default-branch HEAD = the prep set; legacy:
+bg-replace-pipeline edit-preproc) if this host has it staged,
 builds a local models tree of symlinks matching the graph's reference names
 (incl. the `qwen/` subpaths for GGUF + LoRA), and persists the controlnet_aux
 checkpoint dir on the network volume so the depth model downloads once, not
@@ -15,7 +16,15 @@ import glob
 import os
 
 VOL = "/runpod-volume"
-HS_GLOB = "/runpod/model-store/huggingface/Chicolll/bg-replace-pipeline/*/snapshots/*/"
+# RunPod model-store layout: /runpod/model-store/huggingface/<org>/<repo>/<pin>/snapshots/<sha>/…
+# The prep set lives in its OWN repo since 2026-08-22 (bg-replace-preproc: default-branch HEAD = the
+# 5-file set — only default-branch-HEAD pins ever staged; the edit-preproc branch pin wedged 3x).
+# The old repo glob stays as a fallback for hosts staged before the split.
+HS_GLOBS = (
+    "/runpod/model-store/huggingface/Chicolll/bg-replace-preproc/*/snapshots/*/",
+    "/runpod/model-store/huggingface/Chicolll/bg-replace-pipeline/*/snapshots/*/",
+)
+HS_GLOB = HS_GLOBS[0]  # kept for callers that import the old name
 LOCAL = "/opt/prep_models"          # what extra_model_paths.yaml points at
 VOL_MODELS = f"{VOL}/prep-models/ComfyUI/models"  # volume fallback tree
 AUX_CKPTS_VOL = f"{VOL}/prep-models/aux-ckpts"    # depth ckpt persistence
@@ -34,7 +43,7 @@ def run() -> str:
     # snapshot of the same HF repo (video-only, no sam3/qwen). Only snapshots
     # that actually contain the prep set qualify; freshest of those wins.
     snaps = sorted(
-        (s for s in glob.glob(HS_GLOB) if os.path.isdir(os.path.join(s, "sam3"))),
+        (s for g in HS_GLOBS for s in glob.glob(g) if os.path.isdir(os.path.join(s, "sam3"))),
         key=os.path.getmtime,
     )
     hs = snaps[-1] if snaps else None

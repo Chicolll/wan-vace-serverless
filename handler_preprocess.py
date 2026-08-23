@@ -182,9 +182,13 @@ def _prewarm_models(root=PREP_MODELS_ROOT, threads=None, min_bytes=8 * 2**20):
                     files.append(rp)
             except OSError:
                 pass
+    # Pre-warm is a NETWORK-VOLUME remedy (lazy mmap loads at 4-22 MB/s). Files served from the
+    # host NVMe model store load fast on their own — skip them (saves the boot ~27 GB of reads).
+    hs = [f for f in files if f.startswith("/runpod/model-store/")]
+    files = [f for f in files if not f.startswith("/runpod/model-store/")]
     files = sorted(set(files), key=lambda x: -os.path.getsize(x))
     streams = int(threads or os.environ.get("PREP_PREWARM_STREAMS", "16"))
-    out = {"files": [], "n": len(files), "streams": streams}
+    out = {"files": [], "n": len(files), "streams": streams, "skipped_hoststore": len(hs)}
     t0 = time.time()
     # files one after another, each with `streams` parallel ranged readers
     # (total concurrency stays bounded; the big files dominate anyway)
@@ -324,7 +328,7 @@ def handler(job):
     j = job.get("input") or {}
     if j.get("debug"):
         import glob as _glob
-        hs_snaps = _glob.glob("/runpod/model-store/huggingface/Chicolll/bg-replace-pipeline/*/snapshots/*/")
+        hs_snaps = [s for g in prep_setup.HS_GLOBS for s in _glob.glob(g)]
         vol_models = f"{VOL}/prep-models/ComfyUI/models"
         vol_listing = {}
         for sub in ("unet", "loras", "text_encoders", "vae", "sam3"):

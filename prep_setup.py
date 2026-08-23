@@ -27,7 +27,8 @@ HS_GLOBS = (
 HS_GLOB = HS_GLOBS[0]  # kept for callers that import the old name
 LOCAL = "/opt/prep_models"          # what extra_model_paths.yaml points at
 VOL_MODELS = f"{VOL}/prep-models/ComfyUI/models"  # volume fallback tree
-AUX_CKPTS_VOL = f"{VOL}/prep-models/aux-ckpts"    # depth ckpt persistence
+AUX_CKPTS_VOL = f"{VOL}/prep-models/aux-ckpts"    # controlnet_aux ckpts dir (writable; depth ckpt lands here on a miss)
+AUX_HS_SUB = "aux"   # <snapshot>/aux/<hf-repo-id>/<file> mirrors controlnet_aux's ckpts/<repo_id>/<file> layout
 COMFY_DIR = os.environ.get("COMFY_DIR", "/opt/ComfyUI")
 
 
@@ -36,6 +37,41 @@ def _link(src: str, dst: str) -> None:
     if os.path.islink(dst) or os.path.exists(dst):
         return
     os.symlink(src, dst)
+
+
+def _wire_aux(hs):
+    """controlnet_aux resolves ckpts/<hf-repo-id>/<file> and downloads from Hugging Face on a miss
+    (custom_hf_download). ckpts stays the volume dir (writable, survives workers). When the host
+    store snapshot carries an aux/ tree, every file in it is exposed inside ckpts as a symlink to the
+    NVMe copy — replacing any volume copy, which is a redundant download cache. When it does not,
+    dangling links left by a host that had one are removed so the pack can re-download.
+    Returns (wired, cleaned) path lists."""
+    wired, cleaned = [], []
+    aux_src = os.path.join(hs, AUX_HS_SUB) if hs else None
+    if aux_src and os.path.isdir(aux_src):
+        for dp, _, fs in os.walk(aux_src):
+            for fn in fs:
+                src = os.path.join(dp, fn)
+                dst = os.path.join(AUX_CKPTS_VOL, os.path.relpath(src, aux_src))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.islink(dst):
+                    if os.readlink(dst) == src:
+                        wired.append(dst)
+                        continue
+                    os.unlink(dst)
+                elif os.path.exists(dst):
+                    print(f"prep_setup: removing volume copy {dst} (superseded by host store)", flush=True)
+                    os.remove(dst)
+                os.symlink(src, dst)
+                wired.append(dst)
+    if os.path.isdir(AUX_CKPTS_VOL):
+        for dp, _, fs in os.walk(AUX_CKPTS_VOL):
+            for fn in fs:
+                q = os.path.join(dp, fn)
+                if os.path.islink(q) and not os.path.exists(q):
+                    os.unlink(q)
+                    cleaned.append(q)
+    return wired, cleaned
 
 
 def run() -> str:
@@ -69,8 +105,15 @@ def run() -> str:
     _link(os.path.join(src, "text_encoders"), os.path.join(LOCAL, "text_encoders"))
     _link(os.path.join(src, "vae"), os.path.join(LOCAL, "vae"))
     _link(os.path.join(src, "sam3"), os.path.join(LOCAL, "sam3"))
+    # Aux checkpoints: host-store copies linked into ckpts; the ckpts dir itself is linked under
+    # LOCAL so the boot pre-warm walk covers any file that is still volume-resident.
+    wired, cleaned = _wire_aux(hs)
+    _link(AUX_CKPTS_VOL, os.path.join(LOCAL, AUX_HS_SUB))
 
-    state = f"PREP_HOSTSTORE_{'ACTIVE ' + hs if hs else 'ABSENT (volume fallback ' + VOL_MODELS + ')'}"
+    aux_state = f"aux={len(wired)}/hoststore" if wired else "aux=volume"
+    if cleaned:
+        aux_state += f" (cleaned {len(cleaned)} dangling)"
+    state = f"PREP_HOSTSTORE_{'ACTIVE ' + hs if hs else 'ABSENT (volume fallback ' + VOL_MODELS + ')'} {aux_state}"
     print(state, flush=True)
     return state
 

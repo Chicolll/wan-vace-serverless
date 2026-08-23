@@ -2,6 +2,8 @@
   "1":  {"class_type": "EmptyImage", "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}},
   "2":  {"class_type": "SAM3Segment", "inputs": {"image": ["1", 0], "prompt": "person", "output_mode": "Merged", "confidence_threshold": 0.35, "max_segments": 0, "segment_pick": 0, "mask_blur": 0, "mask_offset": 0, "device": "Auto", "invert_output": false, "background": "Color", "background_color": "#808080", "unload_model": false}},
   "3":  {"class_type": "SaveImage", "inputs": {"images": ["2", 0], "filename_prefix": "warmup_sam3"}},
+  "4":  {"class_type": "DepthAnythingV2Preprocessor", "inputs": {"image": ["1", 0], "ckpt_name": "depth_anything_v2_vitl.pth", "resolution": 512}},
+  "5":  {"class_type": "SaveImage", "inputs": {"images": ["4", 0], "filename_prefix": "warmup_depth"}},
   "50": {"class_type": "LoaderGGUF", "inputs": {"gguf_name": "qwen/qwen-image-edit-2511-Q5_0.gguf"}},
   "51": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["50", 0], "lora_name": "qwen/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors", "strength_model": 1}},
   "52": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default"}},

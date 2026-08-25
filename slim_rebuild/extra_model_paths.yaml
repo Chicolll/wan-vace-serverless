@@ -1,0 +1,18 @@
+# Point the baked ComfyUI's model search at the PROVEN model tree on the mounted network volume (the layout the
+# raylight workflow already resolved against on the pod). Models are NOT baked into the image.
+#
+# ⚠ CONFIRM against the volume's actual ComfyUI before building: the base_path and especially where the VACE GGUF
+#   lives (the workflow's unet_name is "gguf/wan-14B_vace_skyreels_v3_R2V_e4m3fn_v1-Q4_K_M.gguf", i.e. a "gguf/"
+#   subdir under the unet/diffusion-models folder). If a model isn't found at boot, fix the subpath here.
+volume:
+  base_path: /runpod-volume/runpod-slim/ComfyUI/
+  is_default: true
+  checkpoints: models/checkpoints
+  unet: models/unet
+  diffusion_models: models/diffusion_models
+  clip: models/clip
+  text_encoders: models/text_encoders
+  clip_vision: models/clip_vision
+  vae: models/vae
+  loras: models/loras
+  gguf: models/unet

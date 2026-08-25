@@ -19,6 +19,7 @@ Output files land in INPUTS_DIR (default /runpod-volume/native-xdit/inputs) —
 flat folder, collision-proof names are the CLIENT's job (bake the date into the
 tag, e.g. DRIVING-D2-0715-BAKED.mp4). See PREPROCESS_ENDPOINT_SPEC.md.
 """
+import hashlib
 import json, os, shutil, subprocess, sys, threading, time
 import urllib.error
 import urllib.request
@@ -81,6 +82,13 @@ def _net_window(t_a, t_b):
     return out
 import prep_setup
 _SETUP_STATE = prep_setup.run()
+# Contract §4 (pipeline-contract.md): on an endpoint that depends on the host
+# NVMe model store, a worker that lands on a host WITHOUT the staged models
+# must die HERE, loudly — not serve an empty model tree and fail minutes later
+# inside the graph. Opt-in by env so volume-fallback endpoints keep booting.
+if os.environ.get("PREP_REQUIRE_HOSTSTORE") == "1" and "PREP_HOSTSTORE_ACTIVE" not in _SETUP_STATE:
+    print(f"FATAL: PREP_REQUIRE_HOSTSTORE=1 but no staged host store ({_SETUP_STATE})", flush=True)
+    sys.exit(3)
 _T_SETUP = time.time()
 
 VOL        = "/runpod-volume"
@@ -313,6 +321,104 @@ def _node_timings(events, graph, top_n=12):
     return out[:top_n]
 
 
+def _fetch_url(url, path, expected=None):
+    """Resumable download to `path` (.part + Range retries). Long streams drop
+    mid-transfer and a dropped connection reads as EOF (8/19: sam3.pt committed
+    at 1.9 of 3.4 GB TWICE) — retry with Range from the .part offset until the
+    size matches; never commit a byte count we can't verify. Returns (bytes,
+    attempts); commits to `path` only when complete (or size unknown)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    attempts = 0
+    got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+    while attempts < 10:
+        attempts += 1
+        if expected is not None and got > expected:
+            # Oversized partial = a previous resume appended a full-restart
+            # response (server ignored the Range; observed 8/19 at exactly
+            # +1 MiB). Corrupt by definition — restart clean.
+            print(f"fetch: oversized partial {got}>{expected}, restarting", flush=True)
+            os.remove(tmp)
+            got = 0
+        try:
+            req = urllib.request.Request(url)
+            if got:
+                req.add_header("Range", f"bytes={got}-")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                status = getattr(r, "status", 200)
+                if got and status != 206:
+                    # Server ignored the Range — this response is the FULL
+                    # file; appending it would corrupt. Restart from zero.
+                    print(f"fetch: Range ignored (HTTP {status}), restarting", flush=True)
+                    mode, got = "wb", 0
+                else:
+                    mode = "ab" if got else "wb"
+                if expected is None and not got:
+                    cl = r.headers.get("Content-Length")
+                    if cl and status == 200:
+                        expected = int(cl)
+                with open(tmp, mode) as f:
+                    shutil.copyfileobj(r, f, length=1 << 20)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise  # presigned URL expired/invalid — retrying cannot help
+            print(f"fetch attempt {attempts} error at {got}B: HTTP {e.code}", flush=True)
+        except Exception as e:  # noqa: BLE001 — transient network; retry from offset
+            print(f"fetch attempt {attempts} error at {got}B: {type(e).__name__}: {e}", flush=True)
+        got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        if expected is not None and got == expected:
+            break
+        if expected is None:
+            break  # no size to verify against; single best-effort pass
+        time.sleep(min(30, 3 * attempts))
+    if expected is None or got == expected:
+        os.replace(tmp, path)
+    return got, attempts
+
+
+def _sha256_file(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _put_url(url, path, attempts=3):
+    """Upload a file to a presigned PUT URL (contract §4: 3 attempts, 2 s/4 s
+    backoff). Returns the ETag. Raises on 401/403 immediately (expired URL —
+    the backend must re-issue) and after the last failed attempt otherwise."""
+    data = open(path, "rb").read()
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, data=data, method="PUT",
+                headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(data))})
+            with urllib.request.urlopen(req, timeout=300) as r:
+                return (r.headers.get("ETag") or "").strip('"')
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise
+            last = f"HTTP {e.code}: {e.read().decode(errors='replace')[:200]}"
+        except Exception as e:  # noqa: BLE001 — transient network
+            last = f"{type(e).__name__}: {e}"
+        print(f"put attempt {i} failed: {last}", flush=True)
+        if i < attempts:
+            time.sleep(2 * i)
+    raise RuntimeError(f"PUT failed after {attempts} attempts: {last}")
+
+
+def _canonical_sha256(obj):
+    """sha256 over byte-stable JSON — matches the backend's canonicalJson
+    (sorted keys at every depth, no whitespace), so both sides can hash the
+    same graph to the same hex and transport corruption of the settings is
+    detectable (contract §1 echo)."""
+    return hashlib.sha256(json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+
+
 def _find_newest(root, needle):
     best, best_m = None, -1
     for dirpath, _, files in os.walk(root):
@@ -421,57 +527,18 @@ def handler(job):
         path = os.path.join(VOL, dest)
         if os.path.exists(path) and not j["fetch"].get("overwrite"):
             return {"fetched": dest, "boot": BOOT, "gpu": _gpu_info(), "bytes": os.path.getsize(path), "skipped": "already exists"}
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.time()
-        tmp = path + ".part"
-        # Resumable download: long streams drop mid-transfer and a dropped
-        # connection reads as EOF (8/19: sam3.pt committed at 1.9 of 3.4 GB
-        # TWICE) — so retry with Range from the .part offset until the size
-        # matches, and never commit a byte count we can't verify.
-        attempts = 0
-        got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-        while attempts < 10:
-            attempts += 1
-            if expected is not None and got > expected:
-                # Oversized partial = a previous resume appended a full-restart
-                # response (server ignored the Range; observed 8/19 at exactly
-                # +1 MiB). Corrupt by definition — restart clean.
-                print(f"fetch: oversized partial {got}>{expected}, restarting", flush=True)
-                os.remove(tmp)
-                got = 0
-            try:
-                req = urllib.request.Request(url)
-                if got:
-                    req.add_header("Range", f"bytes={got}-")
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    status = getattr(r, "status", 200)
-                    if got and status != 206:
-                        # Server ignored the Range — this response is the FULL
-                        # file; appending it would corrupt. Restart from zero.
-                        print(f"fetch: Range ignored (HTTP {status}), restarting", flush=True)
-                        mode, got = "wb", 0
-                    else:
-                        mode = "ab" if got else "wb"
-                    if expected is None and not got:
-                        cl = r.headers.get("Content-Length")
-                        if cl and status == 200:
-                            expected = int(cl)
-                    with open(tmp, mode) as f:
-                        shutil.copyfileobj(r, f, length=1 << 20)
-            except Exception as e:  # noqa: BLE001 — transient network; retry from offset
-                print(f"fetch attempt {attempts} error at {got}B: {type(e).__name__}: {e}", flush=True)
-            got = os.path.getsize(tmp)
-            if expected is not None and got == expected:
-                break
-            if expected is None:
-                break  # no size to verify against; single best-effort pass
-            time.sleep(min(30, 3 * attempts))
+        try:
+            got, attempts = _fetch_url(url, path, expected)
+        except urllib.error.HTTPError as e:
+            return {"error": f"fetch HTTP {e.code} (expired/invalid URL — re-issue and retry)", "fetched": dest}
         if expected is not None and got != expected:
             return {"error": f"fetch incomplete after {attempts} attempts: {got}/{expected} bytes",
                     "fetched": dest, "bytes": got}
-        os.replace(tmp, path)
-        return {"fetched": dest, "boot": BOOT, "gpu": _gpu_info(), "bytes": os.path.getsize(path),
+        return {"fetched": dest, "boot": BOOT, "gpu": _gpu_info(), "bytes": got,
                 "secs": round(time.time() - t0, 1), "attempts": attempts}
+    if j.get("contract_version") is not None:
+        return _contract_job(j)
     graph, outputs = j.get("graph"), j.get("outputs") or {}
     if not graph or not outputs:
         return {"error": "need input.graph and input.outputs"}
@@ -479,40 +546,10 @@ def handler(job):
     ensure_comfy()
     t_boot = time.time()
 
-    # fresh stage subdir per job so needle matching can't hit stale files
-    stage = os.path.join(STAGE_DIR, f"job_{int(t0)}")
-    for nid, node in graph.items():
-        pref = node.get("inputs", {}).get("filename_prefix")
-        if pref is not None:
-            node["inputs"]["filename_prefix"] = f"job_{int(t0)}/" + pref
-
-    import threading
-    client_id = f"prep_{int(t0)}"
-    watch = {"events": [], "stop": False}
-    threading.Thread(target=_node_watch, args=(client_id, watch), daemon=True).start()
-    try:
-        pid = _http("/prompt", {"prompt": graph, "client_id": client_id}).get("prompt_id")
-    except RuntimeError as e:
-        watch["stop"] = True
-        return {"error": "graph rejected", "detail": str(e)[:3000], "log_tail": _tail(LOG)}
-    if not pid:
-        watch["stop"] = True
-        return {"error": "submit failed", "log_tail": _tail(LOG)}
-    deadline = time.time() + int(j.get("timeout_s", 1500))
-    while True:
-        h = _http(f"/history/{pid}")
-        if pid in h:
-            st = h[pid].get("status", {})
-            if st.get("completed") or st.get("status_str") == "success":
-                break
-            if st.get("status_str") == "error":
-                msgs = [m for m in st.get("messages", []) if m and m[0] == "execution_error"]
-                return {"error": "graph execution error",
-                        "detail": json.dumps(msgs)[:1500], "log_tail": _tail(LOG)}
-        if time.time() > deadline:
-            _http("/interrupt", {})
-            return {"error": "graph timeout", "log_tail": _tail(LOG)}
-        time.sleep(5)
+    r = _run_graph(graph, int(j.get("timeout_s", 1500)), t0)
+    if r.get("error"):
+        return r["error"]
+    stage, watch = r["stage"], r["watch"]
     t_graph = time.time()
 
     written, missing = [], []
@@ -524,11 +561,6 @@ def handler(job):
         shutil.move(src, dst)
         written.append({"file": final, "bytes": os.path.getsize(dst)})
     shutil.rmtree(stage, ignore_errors=True)
-    watch["stop"] = True
-    try:
-        if watch.get("ws"): watch["ws"].close()
-    except Exception:
-        pass
     if missing:
         return {"error": "missing outputs", "missing": missing,
                 "written": written, "log_tail": _tail(LOG)}
@@ -537,6 +569,131 @@ def handler(job):
                        "graph_s": round(t_graph - t_boot, 1),
                        "total_s": round(time.time() - t0, 1)},
             "node_timings": _node_timings(watch["events"], graph)}
+
+
+def _run_graph(graph, timeout_s, t0):
+    """Submit + poll one graph in a fresh stage subdir (so needle matching
+    can't hit stale files). Returns {stage, watch} on success or {"error":
+    <ready-to-return dict>} on rejection/execution error/timeout. The watch
+    thread is stopped either way."""
+    stage = os.path.join(STAGE_DIR, f"job_{int(t0)}")
+    for nid, node in graph.items():
+        pref = node.get("inputs", {}).get("filename_prefix")
+        if pref is not None:
+            node["inputs"]["filename_prefix"] = f"job_{int(t0)}/" + pref
+
+    client_id = f"prep_{int(t0)}"
+    watch = {"events": [], "stop": False}
+    threading.Thread(target=_node_watch, args=(client_id, watch), daemon=True).start()
+
+    def _stop_watch():
+        watch["stop"] = True
+        try:
+            if watch.get("ws"): watch["ws"].close()
+        except Exception:
+            pass
+
+    try:
+        pid = _http("/prompt", {"prompt": graph, "client_id": client_id}).get("prompt_id")
+    except RuntimeError as e:
+        _stop_watch()
+        return {"error": {"error": "graph rejected", "detail": str(e)[:3000], "log_tail": _tail(LOG)}}
+    if not pid:
+        _stop_watch()
+        return {"error": {"error": "submit failed", "log_tail": _tail(LOG)}}
+    deadline = time.time() + timeout_s
+    while True:
+        h = _http(f"/history/{pid}")
+        if pid in h:
+            st = h[pid].get("status", {})
+            if st.get("completed") or st.get("status_str") == "success":
+                break
+            if st.get("status_str") == "error":
+                msgs = [m for m in st.get("messages", []) if m and m[0] == "execution_error"]
+                _stop_watch()
+                return {"error": {"error": "graph execution error",
+                                  "detail": json.dumps(msgs)[:1500], "log_tail": _tail(LOG)}}
+        if time.time() > deadline:
+            _http("/interrupt", {})
+            _stop_watch()
+            return {"error": {"error": "graph timeout", "log_tail": _tail(LOG)}}
+        time.sleep(5)
+    _stop_watch()
+    return {"stage": stage, "watch": watch}
+
+
+def _contract_job(j):
+    """Pipeline contract v1 (onset docs/design/pipeline-contract.md §3): ONE
+    job fetches the inputs (byte+sha256-verified BEFORE any GPU work), runs the
+    graph, PUTs each output to its presigned URL, and echoes what ran. Inputs
+    land in INPUTS_DIR by bare name (local disk when the template points there;
+    the volume until then). Transitional dual-write: outputs also land in
+    INPUTS_DIR so the current render leg keeps reading them — dies with the
+    render handler's fetch-by-URL (PREP_DUAL_WRITE=0)."""
+    if j.get("contract_version") != 1:
+        return {"error": "CONTRACT_MISMATCH", "detail": f"worker speaks contract 1, got {j.get('contract_version')!r}"}
+    graph, outputs = j.get("graph"), j.get("outputs") or []
+    if not graph or not outputs:
+        return {"error": "need input.graph and input.outputs"}
+    t0 = time.time()
+
+    # 1. Inputs: fetch + verify BEFORE the GPU is touched (contract §4 — a bad
+    #    transfer fails in seconds with no GPU spend).
+    for spec in j.get("inputs") or []:
+        name = spec["name"]
+        if "/" in name or "\\" in name or ".." in name:
+            return {"error": "FETCH_VERIFY_FAILED", "detail": f"input name {name!r} must be a bare filename"}
+        path = os.path.join(INPUTS_DIR, name)
+        try:
+            got, attempts = _fetch_url(spec["url"], path, spec.get("bytes"))
+        except urllib.error.HTTPError as e:
+            return {"error": "URL_EXPIRED" if e.code in (401, 403) else "FETCH_VERIFY_FAILED",
+                    "detail": f"input {name}: HTTP {e.code}"}
+        if spec.get("bytes") is not None and got != spec["bytes"]:
+            return {"error": "FETCH_VERIFY_FAILED",
+                    "detail": f"input {name}: {got}/{spec['bytes']} bytes after {attempts} attempts"}
+        if spec.get("sha256") and _sha256_file(path) != spec["sha256"]:
+            return {"error": "FETCH_VERIFY_FAILED", "detail": f"input {name}: sha256 mismatch"}
+    t_fetch = time.time()
+
+    # 2. The graph. Hash it BEFORE _run_graph's stage-prefix rewrite mutates it —
+    #    the echo must cover the settings exactly as the backend sent them.
+    graph_hash = _canonical_sha256(graph)
+    ensure_comfy()
+    budget = int(j.get("budget_s", 1200))
+    r = _run_graph(graph, budget, t0)
+    if r.get("error"):
+        return r["error"]
+    stage, watch = r["stage"], r["watch"]
+    t_graph = time.time()
+
+    # 3. Outputs: hash, PUT to storage, echo bytes+sha256+etag per artifact.
+    dual = os.environ.get("PREP_DUAL_WRITE", "1") == "1"
+    done, missing = [], []
+    for spec in outputs:
+        src = _find_newest(stage, spec["needle"]) or _find_newest(STAGE_DIR, spec["needle"])
+        if not src:
+            missing.append(spec["needle"]); continue
+        entry = {"name": spec.get("name"), "key": spec.get("key"),
+                 "bytes": os.path.getsize(src), "sha256": _sha256_file(src)}
+        try:
+            entry["etag"] = _put_url(spec["put_url"], src)
+        except urllib.error.HTTPError as e:
+            return {"error": "URL_EXPIRED" if e.code in (401, 403) else "PUT_FAILED",
+                    "detail": f"output {spec['needle']}: HTTP {e.code}", "log_tail": _tail(LOG)}
+        except Exception as e:  # noqa: BLE001
+            return {"error": "PUT_FAILED", "detail": f"output {spec['needle']}: {str(e)[:300]}"}
+        if dual and spec.get("name"):
+            shutil.move(src, os.path.join(INPUTS_DIR, spec["name"]))
+        done.append(entry)
+    shutil.rmtree(stage, ignore_errors=True)
+    if missing:
+        return {"error": "missing outputs", "missing": missing, "outputs": done, "log_tail": _tail(LOG)}
+    return {"contract_version": 1, "outputs": done,
+            "params_effective": {"graph_sha256": graph_hash, "budget_s": budget},
+            "timings": {"fetch_s": round(t_fetch - t0, 1), "run_s": round(t_graph - t_fetch, 1),
+                        "put_s": round(time.time() - t_graph, 1)},
+            "gpu": _gpu_info(), "boot": BOOT, "node_timings": _node_timings(watch["events"], graph)}
 
 
 _WARM_WATCH = {"events": [], "stop": False}

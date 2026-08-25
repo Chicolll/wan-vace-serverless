@@ -15,9 +15,9 @@ import hashlib
 import os, sys, time, json, glob, base64, traceback, subprocess, threading, shutil, urllib.request, urllib.error
 
 # HOTPATCH RETIRED (pipeline contract §7, red-team H2, 2026-08-24): production
-# code comes from the baked image ONLY. The volume re-exec layer made the
-# running handler unknowable from git and was a code-execution path through the
-# volume's S3 keypair. Images from this commit on ignore code_hotpatch/.
+# code comes from the baked image ONLY. This file's base IS the volume's 7/16
+# hotpatch (the last code that ran through that channel), pulled into git; the
+# b2 comfy_dist files and raylight_nodes_r1.py are baked by the Dockerfile.
 
 
 def log(*a):
@@ -1209,6 +1209,10 @@ def _setup_models():
         if os.path.isdir(VOL_MODELS):
             for name in os.listdir(VOL_MODELS):
                 d = os.path.join(MODELS_DIR, name)
+                # fresh-image stock dirs (empty, real) block the volume symlink — the trueslim
+                # canary 7/15 listed unet `[]` exactly here. Empty real dir -> replace with link.
+                if os.path.isdir(d) and not os.path.islink(d) and not os.listdir(d):
+                    os.rmdir(d)
                 if not os.path.lexists(d):
                     os.symlink(os.path.join(VOL_MODELS, name), d)
         else:
@@ -1344,12 +1348,12 @@ def _install_teardown_logger():
         pass
 _install_teardown_logger()
 
-# --- raylight patch applier: if code_hotpatch ships raylight_nodes_r1.py, install it over
-# raylight's nodes.py BEFORE ComfyUI boots (same delivery channel as the b2 files, no template
-# change needed). Absent file = no-op; fail-safe. GATED on RAYLIGHT_PRESTART=1 (2026-07-09): with
+# --- raylight patch applier: install the baked raylight_nodes_r1.py over raylight's nodes.py
+# BEFORE ComfyUI boots. Source is the IMAGE now (hotpatch retired 8/24), same gating: absent
+# file = no-op; fail-safe. GATED on RAYLIGHT_PRESTART=1 (2026-07-09): with
 # the flag off the worker runs STOCK raylight — flag=0 is a true rollback, no wrapper riding along.
 try:
-    _rlp_src = os.path.join(VOL, "code_hotpatch", "raylight_nodes_r1.py")
+    _rlp_src = "/opt/raylight_nodes_r1.py"
     _rlp_dst = os.path.join(COMFY_DIR, "custom_nodes", "raylight", "src", "raylight", "nodes.py")
     if os.environ.get("RAYLIGHT_PRESTART", "0") == "1" \
             and os.path.isfile(_rlp_src) and os.path.isdir(os.path.dirname(_rlp_dst)):
@@ -1477,11 +1481,79 @@ def _boot_health():
         h["vol_read_ms"] = round((time.time() - t0) * 1000, 1)
     except Exception:
         h["vol_write_ms"] = h.get("vol_write_ms"); h["vol_read_ms"] = None
+    try:  # single-thread MEMORY bench — the 7/15 instrumented boot showed the episode class is
+          # memory-side (8 GB alloc 14.4 s + memcpy 15.5 s while the NVMe read took 0.59 s), which
+          # vol-RTT probes DON'T catch. 256 MB zero-fill + copy; healthy ≈ tens of ms each.
+        t0 = time.time(); _mb = bytearray(256 * 1024 * 1024)
+        h["mem_alloc_ms"] = round((time.time() - t0) * 1000, 1)
+        t0 = time.time(); _mb2 = bytes(_mb)
+        h["mem_copy_ms"] = round((time.time() - t0) * 1000, 1)
+        del _mb, _mb2
+    except Exception:
+        pass
+    try:  # host core-frequency snapshot (min/med/max MHz) — the per-core-speed rival's fingerprint
+        freqs = []
+        base = "/sys/devices/system/cpu"
+        for cn in os.listdir(base):
+            if cn.startswith("cpu") and cn[3:].isdigit():
+                try:
+                    with open(f"{base}/{cn}/cpufreq/scaling_cur_freq") as f:
+                        freqs.append(int(f.read().strip()) // 1000)
+                except Exception:
+                    pass
+        if not freqs:  # cpufreq sysfs absent in many containers -> /proc/cpuinfo
+            freqs = [int(float(l.split(":")[1])) for l in open("/proc/cpuinfo") if l.startswith("cpu MHz")]
+        if freqs:
+            freqs.sort()
+            h["mhz_min"], h["mhz_med"], h["mhz_max"] = freqs[0], freqs[len(freqs)//2], freqs[-1]
+    except Exception:
+        pass
     _beacon("boot_health", **h)
+    return h
+
+
+def _maybe_recycle(h):
+    """DETECT-AND-RECYCLE (2026-07-15): when boot_health reads the degraded-host fingerprint at
+    +3s (vol round-trips ~3x healthy: 7/14 boot 1iocdjmshsyx2f read 29.8/50.8ms vs 10.6/26.4
+    baseline and went on to a 118s models-resident), exit BEFORE any expensive work so RunPod
+    relaunches (~25s cycle, 1-2c) rather than eating a 60-120s boot. Guard rails, in order:
+    endpoint-gated (stagingtest only until validated; RECYCLE_ENDPOINTS extends), double-probe
+    (a one-off spike must confirm on a 1s-later re-read), and a volume-backed budget of 2
+    recycles/worker/hour so a long episode boots through instead of crash-looping (the CA-2
+    lesson: unbounded relaunch loops bill forever)."""
+    eps = set(e for e in os.environ.get("RECYCLE_ENDPOINTS", "69qtffutk83l3o").split(",") if e)
+    if ENDPOINT not in eps:
+        return
+    thr_r = float(os.environ.get("BOOT_MAX_VOLREAD_MS", "20"))
+    thr_w = float(os.environ.get("BOOT_MAX_VOLWRITE_MS", "40"))
+    def _trips(d):
+        return (d.get("vol_read_ms") or 0) >= thr_r and (d.get("vol_write_ms") or 0) >= thr_w
+    if not _trips(h):
+        return
+    time.sleep(1.0)
+    h2 = _boot_health()
+    if not _trips(h2):
+        log("recycle: first probe tripped, re-probe clean — proceeding"); return
+    ledger = os.path.join(WDIR, "recycle_log")
+    try:
+        now = time.time()
+        past = [float(x) for x in open(ledger).read().split()] if os.path.exists(ledger) else []
+        recent = [t for t in past if now - t < 3600]
+        if len(recent) >= 2:
+            log(f"recycle: budget exhausted ({len(recent)} in last hour) — booting through despite {h2}")
+            _beacon("boot_recycle_skipped", reason="budget", h=h, h2=h2)
+            return
+        with open(ledger, "w") as f:
+            f.write(" ".join(str(t) for t in recent + [now]))
+    except Exception as e:
+        log("recycle: ledger error, booting through:", repr(e)); return
+    log(f"RECYCLE: degraded boot_health confirmed twice ({h} / {h2}) — exiting for relaunch")
+    _beacon("boot_recycle", h=h, h2=h2)
+    os._exit(43)
 
 
 try:
-    _boot_health()
+    _maybe_recycle(_boot_health())
 except Exception:
     pass
 
@@ -1495,25 +1567,45 @@ def _ray_head_prestart():
         import shutil as _sh
         if _sh.which("ray") is None:
             log("ray-head: CLI not found; skip"); return
+        # explicit GPU count: the head's raylet inventories resources from ITS env; if the handler's
+        # differs from comfy's, workers see wrong GPUs — one candidate mechanism for 7/14's loop
+        try:
+            _idx = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                                  capture_output=True, text=True, timeout=30).stdout.split()
+            _ngpu = len(_idx)
+        except Exception:
+            _ngpu = 0
+        if _ngpu < 1:
+            log("ray-head: could not count GPUs; skip (connect path stays off)"); return
+        # THE 7/14 ROOT CAUSE (proven by the 7/16 stderr beacon): the handler runs with
+        # CUDA_VISIBLE_DEVICES="" (parent off-GPU by design), so a head inheriting this env is a
+        # 0-GPU cluster -> comfy connects -> actor spawn hangs -> crash-loop. Give the head its
+        # own env with the GPUs visible; the handler process itself stays off-GPU.
+        _env = dict(os.environ); _env["CUDA_VISIBLE_DEVICES"] = ",".join(_idx)
         t0 = time.time()
         r = subprocess.run(["ray", "start", "--head", "--disable-usage-stats",
-                            "--include-dashboard=false"],
-                           capture_output=True, text=True, timeout=120)
+                            "--include-dashboard=false", f"--num-gpus={_ngpu}"],
+                           capture_output=True, text=True, timeout=120, env=_env)
         if r.returncode == 0:
             with open("/tmp/.ray_head_up", "w") as f:
                 f.write(str(time.time()))
-            log(f"ray-head: up in {time.time()-t0:.1f}s")
-            _beacon("ray_head_up", dur_s=round(time.time() - t0, 1))
+            log(f"ray-head: up in {time.time()-t0:.1f}s num_gpus={_ngpu}")
+            _beacon("ray_head_up", dur_s=round(time.time() - t0, 1), num_gpus=_ngpu)
         else:
             log(f"ray-head: start FAILED rc={r.returncode} {(r.stderr or '')[-300:]}")
-            _beacon("ray_head_fail", rc=r.returncode)
+            _beacon("ray_head_fail", rc=r.returncode,
+                    stderr=(r.stderr or "")[-400:], stdout=(r.stdout or "")[-200:])
     except Exception as e:
         log("ray-head: exception", repr(e))
 
 
-# DISABLED after the 7/14 boot breakage (reverted; wrapper flaw suspected, unproven). Re-enable
-# only with the redesigned connect path and a fresh backup chain. RAY_HEAD_PRESTART=1 to test.
-if os.environ.get("RAY_HEAD_PRESTART", "0") == "1":
+# ROUND 2 (2026-07-15, redesigned after the 7/14 breakage): stagingtest-gated by default (prod
+# boots exactly as today even with this deployed); RAY_HEAD_PRESTART=0/1 still overrides both ways.
+# Hardening vs 7/14: explicit --num-gpus on the head; wrapper is ONE-SHOT (a single connect attempt
+# per process, marker deleted after) and VALIDATES cluster resources before accepting the connect.
+_RH_DEFAULT = "1" if ENDPOINT in set(
+    e for e in os.environ.get("RAY_HEAD_ENDPOINTS", "69qtffutk83l3o,8vgr0kn4br5vy5").split(",") if e) else "0"
+if os.environ.get("RAY_HEAD_PRESTART", _RH_DEFAULT) == "1":
     threading.Thread(target=_ray_head_prestart, daemon=True).start()
 
 

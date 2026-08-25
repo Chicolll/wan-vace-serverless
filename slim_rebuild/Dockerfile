@@ -47,6 +47,15 @@ RUN pip install --no-deps -r /tmp/requirements.lock
 COPY patch_raylight_init.py /opt/patch_raylight_init.py
 RUN python /opt/patch_raylight_init.py
 
+# The production raylight patches, BAKED (hotpatch retired 8/24 — these three
+# files were copied from the volume's code_hotpatch/ at every container start
+# by the template's dockerArgs; now they are image content, versioned in git):
+# the b2 pre-shard loader (model_patcher + fsdp_utils) and the r1 nodes patch
+# (applied at boot by the handler iff RAYLIGHT_PRESTART=1 — same env gate).
+COPY comfy_dist_model_patcher_b2.py /opt/ComfyUI/custom_nodes/raylight/src/raylight/comfy_dist/model_patcher.py
+COPY comfy_dist_fsdp_utils_b2.py /opt/ComfyUI/custom_nodes/raylight/src/raylight/comfy_dist/fsdp_utils.py
+COPY raylight_nodes_r1.py /opt/raylight_nodes_r1.py
+
 # /opt runtime files. HOTPATCH RETIRED (pipeline contract §7, 2026-08-24): the handler no
 # longer re-execs from the volume; the image is the only code source. The canary template's
 # dockerArgs must not copy volume code either.

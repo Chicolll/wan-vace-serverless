@@ -390,7 +390,16 @@ def _ensure_comfy_locked(deadline_s):
         [sys.executable, os.path.join(COMFY_DIR, "main.py"),
          "--listen", "127.0.0.1", "--port", str(PORT), "--disable-auto-launch",
          "--input-directory", INPUTS_DIR, "--output-directory", STAGE_DIR,
-         "--extra-model-paths-config", EMP],
+         "--extra-model-paths-config", EMP]
+        # Cache policy. ComfyUI's default keeps EVERY node's output resident until
+        # the prompt ends (built for interactive re-runs). For a one-shot pipeline
+        # that is pure waste: on 2026-09-02 a 720-frame graph held every
+        # intermediate batch at once and the container was OOM-killed at its
+        # 125 GB limit. --cache-none frees a node's result once its consumers
+        # have run (v0.33.1 flag: "Reduced RAM/VRAM usage at the expense of
+        # executing every node for each run" — we run each graph once anyway).
+        # PREP_COMFY_CACHE=classic restores the old behaviour for A/B.
+        + ([] if os.environ.get("PREP_COMFY_CACHE", "none") == "classic" else ["--cache-none"]),
         cwd=COMFY_DIR, stdout=open(LOG, "w"), stderr=subprocess.STDOUT)
     t0 = time.time()
     while time.time() - t0 < deadline_s:

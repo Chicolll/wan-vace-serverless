@@ -121,6 +121,34 @@ def _gpu_info():
 COMFY_DIR  = os.environ.get("COMFY_DIR", "/opt/ComfyUI")
 PREP_MODELS_ROOT = "/opt/prep_models"  # symlink tree -> host store or volume (prep_setup)
 
+# ---- fine hardware telemetry (the render endpoint's 8-stream set, ported 2026-09-02) ----
+# Two 720-frame prep jobs died with "[Errno 111] Connection refused" and NOTHING
+# recorded memory, GPU or process state across the death — the prep image never
+# shipped pod_telemetry.sh. The render image has written meminfo/psi/vmstat/
+# procstate at 1 Hz and GPU at 5 Hz to the volume on every boot since June.
+# Same script, same layout: <volume>/serverless_telemetry/<endpoint>/<worker>/hw/.
+# Streams land on the VOLUME directly, so they survive the worker that wrote them.
+ENDPOINT  = os.environ.get("RUNPOD_ENDPOINT_ID", "unknown-ep")
+WORKER_ID = os.environ.get("RUNPOD_POD_ID", f"pid{os.getpid()}")
+_HERE     = os.path.dirname(os.path.abspath(__file__))
+_TELE_DIR = os.path.join(os.environ.get("TELE_DIR", f"{VOL}/serverless_telemetry"), ENDPOINT, WORKER_ID)
+
+def _hwtele(action, name=""):
+    """start | phase <name> | stop — crash-guarded, niced loggers, never blocks a job."""
+    try:
+        script = os.path.join(_HERE, "pod_telemetry.sh")
+        if not os.path.exists(script):
+            print("hwtele: pod_telemetry.sh missing at", script, flush=True); return
+        os.makedirs(_TELE_DIR, exist_ok=True)
+        env = dict(os.environ); env["TELE_DIR"] = _TELE_DIR
+        subprocess.Popen(["bash", script, action, "hw"] + ([name] if name else []),
+                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print("hwtele", action, "failed:", repr(e), flush=True)
+
+_hwtele("start")
+_hwtele("phase", "handler_import")
+
 
 def _read_seq(path, limit_bytes=None, chunk=32 * 2**20):
     """Sequential read of a file with big chunks (what the network volume is
@@ -238,6 +266,83 @@ def _errs(path, n_ctx=20):
     return "ERR LINES:\n" + "\n".join(hits[-30:]) + "\n--- LAST LINES:\n" + "\n".join(lines[-n_ctx:])
 
 
+def _cgroup_mem():
+    """Container memory facts, cgroup v2 then v1. `oom_kill` is the decisive one:
+    non-zero means the KERNEL killed something in this container for RAM, which
+    is invisible from inside the dead process and looks only like a refused
+    connection from here."""
+    out = {}
+    for key, path in (
+        ("current", "/sys/fs/cgroup/memory.current"),
+        ("peak", "/sys/fs/cgroup/memory.peak"),
+        ("max", "/sys/fs/cgroup/memory.max"),
+        ("current_v1", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ("peak_v1", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"),
+        ("max_v1", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            with open(path) as f:
+                out[key] = f.read().strip()
+        except OSError:
+            pass
+    for path in ("/sys/fs/cgroup/memory.events", "/sys/fs/cgroup/memory/memory.oom_control"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    k, _, v = line.strip().partition(" ")
+                    if "oom" in k:
+                        out[k] = v
+        except OSError:
+            pass
+    return out
+
+
+def _diagnose(where):
+    """Why did ComfyUI stop answering? Collected AT the moment of failure, because
+    RunPod purges job status within minutes and worker stdout is console-only.
+    Distinguishes: process still alive (hang) / exited with a code (crash — the log
+    carries the traceback, e.g. a CUDA OOM) / killed with no trace (kernel OOM-kill,
+    which shows up in cgroup oom_kill and nowhere else).
+    Never raises: a diagnosis that fails must not replace the original error."""
+    d = {"where": where}
+    try:
+        if _comfy is None:
+            d["comfy"] = "never started"
+        else:
+            rc = _comfy.poll()
+            d["comfy"] = "alive" if rc is None else f"exited rc={rc}"
+            if rc is not None and rc < 0:
+                d["comfy_signal"] = -rc  # negative rc = killed by that signal (9 = SIGKILL/OOM)
+    except Exception as e:
+        d["comfy"] = f"<poll failed: {e}>"
+    try:
+        d["mem"] = _cgroup_mem()
+    except Exception as e:
+        d["mem"] = f"<{e}>"
+    try:
+        import subprocess as _sp
+        d["gpu"] = _sp.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                            "--format=csv,noheader"], capture_output=True, text=True,
+                           timeout=10).stdout.strip()
+    except Exception as e:
+        d["gpu"] = f"<{e}>"
+    try:
+        d["comfy_log"] = _errs(LOG)[-4000:]
+    except Exception as e:
+        d["comfy_log"] = f"<{e}>"
+    # The full ComfyUI log is on the worker's ephemeral disk — copy it next to
+    # the telemetry streams so it outlives the worker, and stamp the moment.
+    try:
+        os.makedirs(_TELE_DIR, exist_ok=True)
+        dst = os.path.join(_TELE_DIR, f"comfy_prep_{int(time.time())}.log")
+        shutil.copy(LOG, dst)
+        d["comfy_log_saved"] = dst
+    except Exception as e:
+        d["comfy_log_saved"] = f"<{e}>"
+    _hwtele("phase", f"comfy_unreachable_{where.strip('/').replace('/', '_')[:40]}")
+    return d
+
+
 def _http(path, payload=None, timeout=30):
     req = urllib.request.Request(URL + path,
         data=json.dumps(payload).encode() if payload is not None else None,
@@ -247,6 +352,15 @@ def _http(path, payload=None, timeout=30):
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:3000]
         raise RuntimeError(f"ComfyUI {path} HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        # Connection refused / reset: ComfyUI is not answering. On its own this
+        # says nothing about WHY (observed live 2026-09-02 on a 720-frame graph:
+        # the whole record was "[Errno 111] Connection refused"), so attach the
+        # state that discriminates the causes.
+        raise RuntimeError(
+            f"ComfyUI {path} unreachable: {e.reason} | diagnosis="
+            + json.dumps(_diagnose(path), default=str)[:6000]
+        )
 
 
 _COMFY_LOCK = threading.Lock()
@@ -543,14 +657,18 @@ def handler(job):
     if not graph or not outputs:
         return {"error": "need input.graph and input.outputs"}
     t0 = time.time()
+    _hwtele("phase", f"job_start_{int(t0)}")
     ensure_comfy()
     t_boot = time.time()
 
+    _hwtele("phase", "graph_start")
     r = _run_graph(graph, int(j.get("timeout_s", 1500)), t0)
     if r.get("error"):
+        _hwtele("phase", "graph_failed")
         return r["error"]
     stage, watch = r["stage"], r["watch"]
     t_graph = time.time()
+    _hwtele("phase", "graph_end")
 
     written, missing = [], []
     for needle, final in outputs.items():
@@ -603,7 +721,22 @@ def _run_graph(graph, timeout_s, t0):
         return {"error": {"error": "submit failed", "log_tail": _tail(LOG)}}
     deadline = time.time() + timeout_s
     while True:
-        h = _http(f"/history/{pid}")
+        try:
+            h = _http(f"/history/{pid}")
+        except RuntimeError as e:
+            # ComfyUI stopped answering mid-graph (2026-09-02: two 720-frame
+            # jobs, "[Errno 111] Connection refused", and the node they were
+            # on was lost with the exception). Return the per-node record —
+            # every node that STARTED, in order — so the failure names its
+            # node, plus the diagnosis _http attached (process state, cgroup
+            # memory + oom_kill, GPU memory, ComfyUI log).
+            _stop_watch()
+            ev = list(watch.get("events") or [])
+            return {"error": {"error": "comfy unreachable mid-graph",
+                              "detail": str(e)[:8000],
+                              "nodes_started": _node_timings(ev, graph, top_n=64),
+                              "last_events": [str(x)[:200] for x in ev[-5:]],
+                              "log_tail": _tail(LOG)}}
         if pid in h:
             st = h[pid].get("status", {})
             if st.get("completed") or st.get("status_str") == "success":

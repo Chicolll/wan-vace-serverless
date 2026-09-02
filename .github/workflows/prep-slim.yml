@@ -8,6 +8,7 @@ on:
       - "prep_setup.py"
       - "prep_warmup_graph.json"
       - "gate_nodes.py"
+      - "pod_telemetry.sh"
       - "extra_model_paths_preprocess.yaml"
       - "aivfx_masktools/**"
       - ".github/workflows/prep-slim.yml"

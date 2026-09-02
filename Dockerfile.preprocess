@@ -59,6 +59,7 @@ COPY prep_setup.py                     /opt/prep_setup.py
 COPY prep_warmup_graph.json            /opt/prep_warmup_graph.json
 COPY extra_model_paths_preprocess.yaml /opt/extra_model_paths.yaml
 COPY gate_nodes.py                     /opt/gate_nodes.py
+COPY pod_telemetry.sh                  /opt/pod_telemetry.sh
 
 # BUILD-TIME GATE: boot ComfyUI on CPU, assert every node class the preprocess
 # graph uses is registered, and bake the SQLite migrations + bytecode while at

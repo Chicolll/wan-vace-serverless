@@ -340,6 +340,13 @@ def _diagnose(where):
     except Exception as e:
         d["comfy_log_saved"] = f"<{e}>"
     _hwtele("phase", f"comfy_unreachable_{where.strip('/').replace('/', '_')[:40]}")
+    # The diagnosis itself goes to the volume too — the job result reaches the
+    # backend's logs, but this must be readable with nothing but the volume.
+    try:
+        with open(os.path.join(_TELE_DIR, f"diagnosis_{int(time.time())}.json"), "w") as f:
+            json.dump(d, f, default=str, indent=1)
+    except Exception:
+        pass
     return d
 
 
@@ -390,7 +397,9 @@ def _ensure_comfy_locked(deadline_s):
         if _comfy.poll() is not None:
             raise RuntimeError(f"ComfyUI exited rc={_comfy.returncode}.\n{_errs(LOG)}")
         try:
-            _http("/system_stats"); return
+            # raw probe: a refused connection here is ComfyUI still starting,
+            # not a death — no diagnosis, no log copies
+            urllib.request.urlopen(URL + "/system_stats", timeout=5).read(); return
         except Exception:
             time.sleep(2)
     raise RuntimeError(f"ComfyUI boot timeout. log tail:\n{_tail(LOG)}")
@@ -794,9 +803,13 @@ def _contract_job(j):
     graph_hash = _canonical_sha256(graph)
     ensure_comfy()
     budget = int(j.get("budget_s", 1200))
+    _hwtele("phase", f"job_start_{int(t0)}")
+    _hwtele("phase", "graph_start")
     r = _run_graph(graph, budget, t0)
     if r.get("error"):
+        _hwtele("phase", "graph_failed")
         return r["error"]
+    _hwtele("phase", "graph_end")
     stage, watch = r["stage"], r["watch"]
     t_graph = time.time()
 

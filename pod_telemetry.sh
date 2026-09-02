@@ -111,9 +111,80 @@ case "$cmd" in
         sleep 1
       done' </dev/null >/dev/null 2>&1 &
     p8=$!
-    echo "$p1 $p2 $p3 $p4 $p5 $p6 $p7 $p8" > "$dir/.tele_pids"
+    # 9) PSI pressure — DIRECT stall/contention (cpu/memory/io "some"+"full" avg10/60/300 + total). The
+    #    non-inferred answer to "is it contended": io full avg = % of time ALL work stalled on I/O. @1s
+    setsid nice -n 19 bash -c '
+      echo "ts,resource,line" > "'"$dir"'/psi.csv"
+      while true; do t=$(date +%s.%3N)
+        for r in cpu memory io; do
+          while IFS= read -r ln; do echo "$t,$r,$ln"; done < /proc/pressure/$r 2>/dev/null
+        done >> "'"$dir"'/psi.csv"
+        sleep 1; done' </dev/null >/dev/null 2>&1 &
+    p9=$!
+    # 10) vmstat — pgfault/pgmajfault (major fault = page fetched from backing store = COLD read),
+    #     pgpgin/pgpgout (block I/O pages), pswpin/pswpout (swap). Cumulative -> exact per-phase. @1s
+    setsid nice -n 19 bash -c '
+      while true; do t=$(date +%s.%3N); awk -v t="$t" "{print t\",\"\$1\",\"\$2}" /proc/vmstat >> "'"$dir"'/vmstat.csv"; sleep 1; done' </dev/null >/dev/null 2>&1 &
+    p10=$!
+    # 11) FULL meminfo — every field (Cached/Dirty/Writeback/Slab/MemAvailable/...) not just used. @1s
+    setsid nice -n 19 bash -c '
+      while true; do t=$(date +%s.%3N); awk -v t="$t" "{gsub(/:/,\"\",\$1); print t\",\"\$1\",\"\$2}" /proc/meminfo >> "'"$dir"'/meminfo.csv"; sleep 1; done' </dev/null >/dev/null 2>&1 &
+    p11=$!
+    # 12) per-PROCESS io for ALL pids — rchar (bytes read via syscalls) + read_bytes (bytes from block
+    #     layer). DIRECT read attribution: which PID read the shard, and whether it hit the device. @2s
+    setsid nice -n 19 bash -c '
+      echo "ts,pid,comm,rchar,read_bytes,wchar,write_bytes" > "'"$dir"'/allproc_io.csv"
+      while true; do t=$(date +%s.%3N)
+        for pp in /proc/[0-9]*; do
+          [ -r "$pp/io" ] || continue
+          cm=$(tr -d "\000" < "$pp/comm" 2>/dev/null)
+          awk -v t="$t" -v pid="${pp#/proc/}" -v cm="$cm" "
+            /^rchar/{rc=\$2} /^wchar/{wc=\$2} /^read_bytes/{rb=\$2} /^write_bytes/{wb=\$2}
+            END{print t\",\"pid\",\"cm\",\"rc\",\"rb\",\"wc\",\"wb}" "$pp/io" 2>/dev/null
+        done >> "'"$dir"'/allproc_io.csv"
+        sleep 2; done' </dev/null >/dev/null 2>&1 &
+    p12=$!
+    # 13) loadavg + established TCP conn count (MooseFS chunkserver connections live here). @2s
+    setsid nice -n 19 bash -c '
+      echo "ts,load1,load5,load15,tcp_established" > "'"$dir"'/loadavg.csv"
+      while true; do t=$(date +%s.%3N); set -- $(cut -d" " -f1-3 /proc/loadavg)
+        te=$(awk "NR>1 && \$4==\"01\"" /proc/net/tcp /proc/net/tcp6 2>/dev/null | wc -l)
+        echo "$t,$1,$2,$3,$te" >> "'"$dir"'/loadavg.csv"; sleep 2; done' </dev/null >/dev/null 2>&1 &
+    p13=$!
+    # 14) PROCESS/THREAD STALL TRACKER — for EVERY python/ray thread: state (R=run, D=uninterruptible
+    #     I/O wait, S=sleep) + wchan (the EXACT kernel function it is blocked in) + cpu-time. This is the
+    #     DIRECT "where is rank1 stuck": D + fuse_* = MooseFS read hang; S + futex = NCCL/lock wait;
+    #     poll_schedule = network wait; R + climbing utime = spinning/compute. @2s -> procstate.csv
+    setsid nice -n 19 bash -c '
+      echo "ts,pid,tid,comm,state,wchan,utime,stime,rss_kb" > "'"$dir"'/procstate.csv"
+      while true; do t=$(date +%s.%3N)
+        for pp in /proc/[0-9]*; do
+          cm=$(tr -d "\000" < "$pp/comm" 2>/dev/null)          # EVERY process in the container (incl mfsmount if visible)
+          rss=$(awk "/^VmRSS/{print \$2}" "$pp/status" 2>/dev/null)
+          for tt in "$pp"/task/[0-9]*; do
+            s=$(cut -d" " -f3 "$tt/stat" 2>/dev/null); ut=$(cut -d" " -f14 "$tt/stat" 2>/dev/null); sm=$(cut -d" " -f15 "$tt/stat" 2>/dev/null)
+            wc=$(cat "$tt/wchan" 2>/dev/null)
+            echo "$t,${pp#/proc/},${tt##*/},$cm,$s,$wc,$ut,$sm,$rss" >> "'"$dir"'/procstate.csv"
+          done
+        done
+        sleep 1; done' </dev/null >/dev/null 2>&1 &
+    p14=$!
+    # 15) full KERNEL STACK of EVERY thread @4s -> stacks.txt (the exact call chain of whatever is blocked).
+    setsid nice -n 19 bash -c '
+      while true; do t=$(date +%s.%3N)
+        for pp in /proc/[0-9]*; do
+          cm=$(tr -d "\000" < "$pp/comm" 2>/dev/null)
+          for tt in "$pp"/task/[0-9]*; do
+            s=$(cut -d" " -f3 "$tt/stat" 2>/dev/null)
+            echo "=== $t pid=${pp#/proc/} tid=${tt##*/} comm=$cm state=$s wchan=$(cat $tt/wchan 2>/dev/null)" >> "'"$dir"'/stacks.txt"
+            cat "$tt/stack" 2>/dev/null >> "'"$dir"'/stacks.txt"
+          done
+        done
+        sleep 4; done' </dev/null >/dev/null 2>&1 &
+    p15=$!
+    echo "$p1 $p2 $p3 $p4 $p5 $p6 $p7 $p8 $p9 $p10 $p11 $p12 $p13 $p14 $p15" > "$dir/.tele_pids"
     echo "$(ts) telemetry_start" >> "$dir/phases.log"
-    echo "TELE_START pids=$p1..$p7 -> $dir/{gpu_dmon.txt,gpu_mem.csv,sys.csv,disk.csv,nvlink.csv,percpu.csv,proc.csv,gpu_apps.csv}" ;;
+    echo "TELE_START pids=$p1..$p15 -> $dir/{gpu_dmon,gpu_hifreq,sys,disk,nvlink,percpu,proc,gpu_apps,net,psi,vmstat,meminfo,allproc_io,loadavg,procstate,stacks}" ;;
   phase)
     echo "$(ts) ${3:-phase}" >> "$dir/phases.log"
     echo "PHASE_STAMPED ${3:-phase} @ $(ts)" ;;

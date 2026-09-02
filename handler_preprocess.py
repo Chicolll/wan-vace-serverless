@@ -700,7 +700,7 @@ def handler(job):
     if missing:
         return {"error": "missing outputs", "missing": missing,
                 "written": written, "log_tail": _tail(LOG)}
-    return {"written": written, "gpu": _gpu_info(), "boot": BOOT,
+    return {"written": written, "gpu": _gpu_info(), "boot": BOOT, "mem": _cgroup_mem(),
             "timing": {"boot_s": round(t_boot - t0, 1),
                        "graph_s": round(t_graph - t_boot, 1),
                        "total_s": round(time.time() - t0, 1)},
@@ -844,7 +844,7 @@ def _contract_job(j):
     shutil.rmtree(stage, ignore_errors=True)
     if missing:
         return {"error": "missing outputs", "missing": missing, "outputs": done, "log_tail": _tail(LOG)}
-    return {"contract_version": 1, "outputs": done,
+    return {"mem": _cgroup_mem(),"contract_version": 1, "outputs": done,
             "params_effective": {"graph_sha256": graph_hash, "budget_s": budget},
             "timings": {"fetch_s": round(t_fetch - t0, 1), "run_s": round(t_graph - t_fetch, 1),
                         "put_s": round(time.time() - t_graph, 1)},

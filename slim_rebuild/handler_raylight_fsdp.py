@@ -1018,7 +1018,9 @@ def handler(event):
             except Exception: continue
             if pid in h:
                 st = h[pid].get("status", {})
-                if st.get("status_str") != "success": err = json.dumps(st.get("messages", []))[:1500]
+                # Keep the TAIL: ComfyUI's messages end with the exception; the old head-cut at
+                # 1,500 chars dropped the exception class on every 9/03 single-H100 failure.
+                if st.get("status_str") != "success": err = json.dumps(st.get("messages", []))[-6000:]
                 break
         t_done = time.time()
         vram_exit = _vram_used()

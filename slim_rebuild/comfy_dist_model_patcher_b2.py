@@ -545,8 +545,17 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     skip = True  # skip random weights in non leaf modules
                     break
             if not skip and (hasattr(m, "comfy_cast_weights") or len(params) > 0):
+                # ComfyUI >= 0.27 entry shape: (module_offload_mem, module_mem, n, m, params).
+                # Its partially_unload() reads unload_list[0][1] as a number; the old
+                # 4-tuple put the module NAME there, and the first single-H100 run that
+                # reached the memory-pressure path died with
+                # "TypeError: '<' not supported between instances of 'str' and 'float'"
+                # (2026-09-03, job c4833fd3, 480 frames, ComfyUI 0.27.0). Offload cost =
+                # module size (upstream's base value; its LoRA / cast-dtype surcharge is a
+                # buffer-sizing estimate that does not apply to FSDP-sharded fp8 weights).
+                module_mem = comfy.model_management.module_size(m)
                 prepend = (not hasattr(m, "comfy_cast_weights"),) if prio_comfy_cast_weights else ()
-                loading.append(prepend + (comfy.model_management.module_size(m), n, m, params))
+                loading.append(prepend + (module_mem, module_mem, n, m, params))
         return loading
 
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
@@ -561,7 +570,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
             loading.sort(reverse=True)
             for x in loading:
-                module_mem, n, m, params = x
+                module_offload_mem, module_mem, n, m, params = x
 
                 weight_key = "{}.weight".format(n)
                 bias_key = "{}.bias".format(n)
